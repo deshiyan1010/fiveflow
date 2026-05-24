@@ -11,6 +11,7 @@ import threading
 import subprocess
 import time
 import math
+import datetime
 
 import numpy as np
 import sounddevice as sd
@@ -44,8 +45,9 @@ from AppKit import (
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSApplicationActivationPolicyAccessory,
     NSTrackingArea, NSTrackingMouseEnteredAndExited, NSTrackingActiveAlways,
+    NSScrollView, NSTextField, NSButton,
 )
-from Foundation import NSObject, NSTimer, NSMakeRect, NSMakePoint, NSDictionary
+from Foundation import NSObject, NSTimer, NSMakeRect, NSMakePoint, NSMakeSize, NSDictionary, NSMutableAttributedString
 
 SAMPLE_RATE  = 16000
 WIN_W, WIN_H = 280, 100
@@ -56,6 +58,9 @@ NSBackingStoreBuffered   = 2
 
 _state_queue  = queue.Queue()
 _audio_level  = 0.0  # RMS amplitude 0–1, written by audio callback, read by UI
+
+_transcription_history   = []     # list of dicts: {time, mode, text}
+_toggle_history_callback = [None]  # called when idle pill is clicked
 
 
 def request_accessibility():
@@ -103,20 +108,33 @@ class PillView(NSView):
         self.setNeedsDisplay_(True)
 
     def hitTest_(self, point):
-        # Pass all clicks through except when cursor is on the close button.
-        if self._hovering and self._state == 'idle':
+        if self._state != 'idle':
+            return None
+        bw = self.bounds().size.width
+        # Close button (only when hovering)
+        if self._hovering:
             dx = point.x - self._CLOSE_CX
             dy = point.y - self._CLOSE_CY
             if dx * dx + dy * dy <= self._CLOSE_R ** 2:
                 return self
+        # Pill body — expanded hit area so it's easy to click
+        px0 = (bw - 60) / 2 - 8
+        px1 = (bw + 60) / 2 + 8
+        if px0 <= point.x <= px1 and 0 <= point.y <= 24:
+            return self
         return None
 
     def mouseUp_(self, event):
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
+        # Close button
         dx = loc.x - self._CLOSE_CX
         dy = loc.y - self._CLOSE_CY
-        if dx * dx + dy * dy <= self._CLOSE_R ** 2:
+        if self._hovering and dx * dx + dy * dy <= self._CLOSE_R ** 2:
             NSApplication.sharedApplication().terminate_(None)
+            return
+        # Pill body → toggle history window
+        if _toggle_history_callback[0]:
+            _toggle_history_callback[0]()
 
     def drawRect_(self, rect):
         NSColor.clearColor().set()
@@ -214,6 +232,314 @@ class PillView(NSView):
             self.setNeedsDisplay_(True)
 
 
+class _CopyButton(NSButton):
+    _copy_text = ''
+
+    def performCopy_(self, sender):
+        subprocess.run(["pbcopy"], input=self._copy_text.encode())
+        self.setTitle_("Copied!")
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.5, self, b'resetCopyTitle:', None, False
+        )
+
+    def resetCopyTitle_(self, timer):
+        self.setTitle_("Copy")
+
+
+class _DividerView(NSView):
+    def drawRect_(self, rect):
+        NSColor.colorWithRed_green_blue_alpha_(0.85, 0.85, 0.87, 1.0).set()
+        NSBezierPath.fillRect_(self.bounds())
+
+
+class _EntryCardView(NSView):
+    def drawRect_(self, rect):
+        NSColor.clearColor().set()
+        NSBezierPath.fillRect_(self.bounds())
+        bw = self.bounds().size.width
+        bh = self.bounds().size.height
+        NSColor.colorWithRed_green_blue_alpha_(0.96, 0.96, 0.97, 1.0).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(0, 0, bw, bh), 10, 10
+        ).fill()
+
+
+class _HistoryContainerView(NSView):
+    def drawRect_(self, rect):
+        NSColor.clearColor().set()
+        NSBezierPath.fillRect_(self.bounds())
+        bw = self.bounds().size.width
+        bh = self.bounds().size.height
+        NSColor.whiteColor().set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(0, 0, bw, bh), 16, 16
+        ).fill()
+
+
+class HistoryWindowController(NSObject):
+    _panel        = None
+    _scroll_view  = None
+    _content_view = None
+    _visible      = False
+    _content_W    = 0
+    _W = 440
+    _H = 480
+
+    @objc.python_method
+    def setup(self):
+        W, H = self._W, self._H
+        panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, W, H),
+            NSBorderlessWindowMask | NSNonactivatingPanelMask,
+            NSBackingStoreBuffered,
+            False,
+        )
+        panel.setBackgroundColor_(NSColor.clearColor())
+        panel.setOpaque_(False)
+        panel.setLevel_(NSStatusWindowLevel)
+        panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorTransient
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        panel.setHasShadow_(True)
+
+        container = _HistoryContainerView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+        panel.setContentView_(container)
+
+        PAD = 16
+        # Title
+        title = NSTextField.alloc().initWithFrame_(NSMakeRect(PAD, H - PAD - 20, W - 2*PAD, 20))
+        title.setEditable_(False)
+        title.setSelectable_(False)
+        title.setBordered_(False)
+        title.setBackgroundColor_(NSColor.clearColor())
+        title.setStringValue_("Transcription History")
+        title.setFont_(NSFont.boldSystemFontOfSize_(14))
+        title.setTextColor_(NSColor.colorWithRed_green_blue_alpha_(0.11, 0.11, 0.13, 1.0))
+        container.addSubview_(title)
+
+        # Divider below title
+        div_y = H - PAD - 20 - 9
+        container.addSubview_(
+            _DividerView.alloc().initWithFrame_(NSMakeRect(PAD, div_y, W - 2*PAD, 1))
+        )
+
+        scroll_y = PAD
+        scroll_h = div_y - 8 - scroll_y
+        scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(PAD, scroll_y, W - 2*PAD, scroll_h)
+        )
+        scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setBorderType_(0)
+
+        content_w = W - 2*PAD - 16
+        content = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, content_w, scroll_h))
+        scroll.setDocumentView_(content)
+        container.addSubview_(scroll)
+
+        self._panel        = panel
+        self._scroll_view  = scroll
+        self._content_view = content
+        self._content_W    = content_w
+
+    @objc.python_method
+    def toggle_near_frame(self, pill_frame):
+        if self._visible:
+            self._panel.orderOut_(None)
+            self._visible = False
+            return
+        W, H = self._W, self._H
+        px = pill_frame.origin.x + (pill_frame.size.width - W) / 2
+        py = pill_frame.origin.y + pill_frame.size.height + 8
+        sr = NSScreen.mainScreen().frame()
+        py = min(py, sr.origin.y + sr.size.height - H - 10)
+        px = max(sr.origin.x + 10, min(px, sr.origin.x + sr.size.width - W - 10))
+        self._panel.setFrameOrigin_(NSMakePoint(px, py))
+        self._update_content()
+        self._panel.orderFrontRegardless()
+        self._visible = True
+
+    @objc.python_method
+    def _text_height(self, text, font, width):
+        attrs = NSDictionary.dictionaryWithObjects_forKeys_([font], [NSFontAttributeName])
+        astr  = NSAttributedString.alloc().initWithString_attributes_(text or ' ', attrs)
+        br    = astr.boundingRectWithSize_options_(NSMakeSize(width, 100000), 1)
+        return math.ceil(br.size.height) + 6
+
+    @objc.python_method
+    def _make_label(self, text, font, color, frame):
+        tf = NSTextField.alloc().initWithFrame_(frame)
+        tf.setEditable_(False)
+        tf.setSelectable_(True)
+        tf.setBordered_(False)
+        tf.setBackgroundColor_(NSColor.clearColor())
+        tf.setStringValue_(text)
+        tf.setFont_(font)
+        tf.setTextColor_(color)
+        tf.cell().setWraps_(True)
+        tf.cell().setUsesSingleLineMode_(False)
+        tf.cell().setLineBreakMode_(0)
+        return tf
+
+    @objc.python_method
+    def _make_copy_btn(self, copy_text, frame):
+        btn = _CopyButton.alloc().initWithFrame_(frame)
+        btn._copy_text = copy_text
+        btn.setTitle_("Copy")
+        btn.setBezelStyle_(12)
+        btn.setButtonType_(0)
+        btn.setFont_(NSFont.systemFontOfSize_(11))
+        btn.setTarget_(btn)
+        btn.setAction_(b'performCopy:')
+        return btn
+
+    @objc.python_method
+    def _update_content(self):
+        for sv in list(self._content_view.subviews()):
+            sv.removeFromSuperview()
+
+        history = list(_transcription_history)
+        W = self._content_W
+
+        CARD_X    = 4     # outer horizontal margin inside content view
+        IV        = 12    # card vertical inner padding (top & bottom)
+        IH        = 14    # card horizontal inner padding
+        GAP       = 8     # gap between cards
+        BTN_W     = 56
+        BTN_H     = 22
+        HEAD_H    = 16    # time + mode header row
+        ROW_H     = BTN_H # label + copy-button row height
+        LABEL_H   = 13
+        DIV_TOTAL = 17    # space reserved for divider line (8 + 1 + 8)
+
+        card_w = W - 2 * CARD_X
+        text_w = card_w - 2 * IH
+
+        body_font  = NSFont.systemFontOfSize_(13)
+        meta_font  = NSFont.systemFontOfSize_(11)
+        label_font = NSFont.boldSystemFontOfSize_(10)
+
+        near_black = NSColor.colorWithRed_green_blue_alpha_(0.11, 0.11, 0.13, 1.0)
+        mid_gray   = NSColor.colorWithRed_green_blue_alpha_(0.53, 0.53, 0.56, 1.0)
+        blue       = NSColor.colorWithRed_green_blue_alpha_(0.20, 0.47, 0.96, 1.0)
+        orange     = NSColor.colorWithRed_green_blue_alpha_(0.85, 0.40, 0.10, 1.0)
+
+        if not history:
+            self._content_view.addSubview_(self._make_label(
+                "No transcriptions yet.", NSFont.systemFontOfSize_(13), mid_gray,
+                NSMakeRect(CARD_X + IH, 20, card_w - 2*IH, 24)
+            ))
+            return
+
+        # ── First pass: compute card heights ────────────────────────────────
+        items = []
+        for entry in reversed(history):
+            if entry['mode'] == 'transcribe':
+                th = self._text_height(entry['text'], body_font, text_w)
+                card_h = IV + HEAD_H + 8 + th + 6 + BTN_H + IV
+                items.append((entry, card_h, {'th': th}))
+            else:
+                cmd = entry.get('command', '')
+                ch  = self._text_height(cmd, body_font, text_w)
+                oh  = self._text_height(entry['text'], body_font, text_w)
+                card_h = IV + HEAD_H + 8 + ROW_H + 4 + ch + DIV_TOTAL + ROW_H + 4 + oh + IV
+                items.append((entry, card_h, {'ch': ch, 'oh': oh, 'cmd': cmd}))
+
+        total_h = GAP + sum(card_h + GAP for _, card_h, _ in items)
+        total_h = max(total_h, self._scroll_view.frame().size.height)
+
+        self._content_view.setFrame_(NSMakeRect(0, 0, W, total_h))
+
+        # ── Second pass: lay out cards top-to-bottom ─────────────────────────
+        y_cursor = total_h - GAP
+
+        for entry, card_h, dims in items:
+            card_y = y_cursor - card_h
+            card = _EntryCardView.alloc().initWithFrame_(
+                NSMakeRect(CARD_X, card_y, card_w, card_h)
+            )
+            self._content_view.addSubview_(card)
+
+            y = card_h - IV  # tracks position within card, decreasing toward bottom
+
+            # Header: time (gray) + mode (colored)
+            time_str   = entry['time'].strftime("%-I:%M %p")
+            mode_str   = "Transcribe" if entry['mode'] == 'transcribe' else "Command"
+            mode_color = blue if entry['mode'] == 'transcribe' else orange
+            card.addSubview_(self._make_label(
+                time_str, meta_font, mid_gray,
+                NSMakeRect(IH, y - HEAD_H, 66, HEAD_H)
+            ))
+            card.addSubview_(self._make_label(
+                "·  " + mode_str, meta_font, mode_color,
+                NSMakeRect(IH + 70, y - HEAD_H, 110, HEAD_H)
+            ))
+            y -= HEAD_H + 8
+
+            if entry['mode'] == 'transcribe':
+                th = dims['th']
+                card.addSubview_(self._make_label(
+                    entry['text'], body_font, near_black,
+                    NSMakeRect(IH, y - th, text_w, th)
+                ))
+                y -= th + 6
+                card.addSubview_(self._make_copy_btn(
+                    entry['text'],
+                    NSMakeRect(card_w - IH - BTN_W, y - BTN_H, BTN_W, BTN_H)
+                ))
+
+            else:
+                ch  = dims['ch']
+                oh  = dims['oh']
+                cmd = dims['cmd']
+                lv  = (ROW_H - LABEL_H) / 2  # vertical offset to center label in row
+
+                # Voice command section label + copy button
+                card.addSubview_(self._make_label(
+                    "VOICE COMMAND", label_font, mid_gray,
+                    NSMakeRect(IH, y - ROW_H + lv, card_w - 2*IH - BTN_W - 6, LABEL_H)
+                ))
+                card.addSubview_(self._make_copy_btn(
+                    cmd, NSMakeRect(card_w - IH - BTN_W, y - ROW_H, BTN_W, BTN_H)
+                ))
+                y -= ROW_H + 4
+                card.addSubview_(self._make_label(
+                    cmd, body_font, near_black,
+                    NSMakeRect(IH, y - ch, text_w, ch)
+                ))
+                y -= ch
+
+                # Divider
+                card.addSubview_(
+                    _DividerView.alloc().initWithFrame_(
+                        NSMakeRect(IH, y - DIV_TOTAL // 2, card_w - 2*IH, 1)
+                    )
+                )
+                y -= DIV_TOTAL
+
+                # Output section label + copy button
+                card.addSubview_(self._make_label(
+                    "OUTPUT", label_font, mid_gray,
+                    NSMakeRect(IH, y - ROW_H + lv, card_w - 2*IH - BTN_W - 6, LABEL_H)
+                ))
+                card.addSubview_(self._make_copy_btn(
+                    entry['text'], NSMakeRect(card_w - IH - BTN_W, y - ROW_H, BTN_W, BTN_H)
+                ))
+                y -= ROW_H + 4
+                card.addSubview_(self._make_label(
+                    entry['text'], body_font, near_black,
+                    NSMakeRect(IH, y - oh, text_w, oh)
+                ))
+
+            y_cursor = card_y - GAP
+
+        # Scroll to top (newest entry)
+        self._content_view.scrollRectToVisible_(NSMakeRect(0, total_h - 1, W, 1))
+
+
 class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, notification):
         sf = NSScreen.mainScreen().frame()
@@ -245,6 +571,15 @@ class AppDelegate(NSObject):
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.05, view, b'checkQueue:', None, True
         )
+
+        history_ctrl = HistoryWindowController.alloc().init()
+        history_ctrl.setup()
+        self._history_ctrl = history_ctrl
+
+        pill_panel = self._panel
+        def _toggle_history():
+            history_ctrl.toggle_near_frame(pill_panel.frame())
+        _toggle_history_callback[0] = _toggle_history
 
 
 def set_widget(state, label=''):
@@ -300,12 +635,13 @@ def main():
         transcript = result["text"].strip()
         print(f"Transcript: {transcript}")
 
-        set_widget('active', 'Correcting...')
+        set_widget('active', 'Formating...')
         _gemma_in.put(('transcribe', transcript))
-        corrected = _gemma_out.get()
-        print(f"Corrected:  {corrected}")
+        formated = _gemma_out.get()
+        print(f"Formated:  {formated}")
 
-        paste_at_cursor(corrected)
+        _transcription_history.append({'time': datetime.datetime.now(), 'mode': 'transcribe', 'text': formated})
+        paste_at_cursor(formated)
         set_widget('active', 'Done')
         time.sleep(1.5)
         set_widget('idle')
@@ -322,6 +658,7 @@ def main():
         output = _gemma_out.get()
         print(f"Output:   {output}")
 
+        _transcription_history.append({'time': datetime.datetime.now(), 'mode': 'command', 'command': command, 'text': output})
         paste_at_cursor(output)
         set_widget('active', 'Done')
         time.sleep(1.5)
@@ -452,7 +789,7 @@ def main():
                 if task[0] == 'transcribe':
                     content = (
                         "Fix only punctuation and obvious transcription errors. "
-                        "Return the corrected text and nothing else.\n\n" + task[1]
+                        "Return the formated text and nothing else.\n\n" + task[1]
                     )
                 else:  # command
                     command, selected = task[1], task[2]
