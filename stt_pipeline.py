@@ -1,5 +1,4 @@
 import os
-os.environ["HF_TOKEN"] = ""
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -588,8 +587,47 @@ def set_widget(state, label=''):
 
 # ── STT logic ─────────────────────────────────────────────────────────────────
 
+_WHISPER_ID = _WHISPER_ID
+
+
+def _prompt_hf_token_if_needed():
+    """Prompt for an HF token when either model isn't cached yet."""
+    from pathlib import Path
+    cache = Path.home() / ".cache" / "huggingface" / "hub"
+
+    def is_cached(model_id):
+        return (cache / ("models--" + model_id.replace("/", "--"))).exists()
+
+    whisper_ok = is_cached(_WHISPER_ID)
+    gemma_ok   = is_cached(GEMMA_MODEL_ID)
+
+    if whisper_ok and gemma_ok:
+        return  # nothing to download
+
+    missing = []
+    if not whisper_ok:
+        missing.append(f"  • {_WHISPER_ID}")
+    if not gemma_ok:
+        missing.append(f"  • {GEMMA_MODEL_ID}")
+
+    print("\nThe following models are not cached and need to be downloaded:")
+    for m in missing:
+        print(m)
+    print()
+    print("A Hugging Face token (huggingface.co/settings/tokens) speeds up the download.")
+    print("If you skip this, the download will be very slow (no rate-limit bypass).")
+    print()
+    token = input("HF token [press Enter to skip]: ").strip()
+    if token:
+        os.environ["HF_TOKEN"] = token
+        print()
+    else:
+        print("⚠  Warning: downloading without a token will be very slow.\n")
+
+
 def main():
     request_accessibility()
+    _prompt_hf_token_if_needed()
 
     recording    = False
     frames       = []
@@ -764,11 +802,11 @@ def main():
             device = "mps" if torch.backends.mps.is_available() else "cpu"
             dtype  = torch.float16 if device == "mps" else torch.float32
             w_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                "openai/whisper-large-v3-turbo", dtype=dtype,
+                _WHISPER_ID, dtype=dtype,
                 low_cpu_mem_usage=True, use_safetensors=True,
             )
             w_model.to(device)
-            w_processor = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+            w_processor = AutoProcessor.from_pretrained(_WHISPER_ID)
             _pipe[0] = pipeline(
                 "automatic-speech-recognition",
                 model=w_model, tokenizer=w_processor.tokenizer,
