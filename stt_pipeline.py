@@ -587,7 +587,7 @@ def set_widget(state, label=''):
 
 # ── STT logic ─────────────────────────────────────────────────────────────────
 
-_WHISPER_ID = _WHISPER_ID
+_WHISPER_ID = "openai/whisper-large-v3-turbo"
 
 
 def _prompt_hf_token_if_needed():
