@@ -673,13 +673,13 @@ def main():
         transcript = result["text"].strip()
         print(f"Transcript: {transcript}")
 
-        set_widget('active', 'Formating...')
+        set_widget('active', 'Formatting...')
         _gemma_in.put(('transcribe', transcript))
-        formated = _gemma_out.get()
-        print(f"Formated:  {formated}")
+        formatted = _gemma_out.get()
+        print(f"Formatted:  {formatted}")
 
-        _transcription_history.append({'time': datetime.datetime.now(), 'mode': 'transcribe', 'text': formated})
-        paste_at_cursor(formated)
+        _transcription_history.append({'time': datetime.datetime.now(), 'mode': 'transcribe', 'text': formatted})
+        paste_at_cursor(formatted)
         set_widget('active', 'Done')
         time.sleep(1.5)
         set_widget('idle')
@@ -827,7 +827,7 @@ def main():
                 if task[0] == 'transcribe':
                     content = (
                         "Fix only punctuation and obvious transcription errors. "
-                        "Return the formated text and nothing else.\n\n" + task[1]
+                        "Return the formatted text and nothing else.\n\n" + task[1]
                     )
                 else:  # command
                     command, selected = task[1], task[2]
