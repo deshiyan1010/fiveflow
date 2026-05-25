@@ -954,28 +954,60 @@ def main():
             while True:
                 task = _gemma_in.get()
                 if task[0] == 'transcribe':
-                    content = (
-                        "Fix only punctuation and obvious transcription errors. "
-                        "Return the formatted text and nothing else.\n\n" + task[1]
+                    sys_prompt = (
+                        "You are a transcription editor for spoken English. "
+                        "Your only job is to fix punctuation and sentence flow. "
+                        "You must not change, add, or remove any words.\n\n"
+                        "Rules:\n"
+                        "- When two phrases are part of the same continuous thought, join them with a comma, "
+                        "em-dash, semicolon, or conjunction — never a full stop\n"
+                        "- Only place a full stop when the thought is genuinely complete and the next clause "
+                        "is an independent, separate idea\n"
+                        "- Do not rephrase, restructure, or paraphrase anything\n"
+                        "- Do not add any words, filler, or commentary that was not in the original\n"
+                        "- Return only the corrected transcription, nothing else"
                     )
+                    messages = [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user",   "content": task[1]},
+                    ]
+                    max_tok, temp = 384, 0.15
                 else:  # command
                     command, selected = task[1], task[2]
+                    sys_prompt = (
+                        "You are a precise voice command executor. "
+                        "Execute the user's command exactly and return only the result — "
+                        "no preamble, label, explanation, or commentary of any kind.\n\n"
+                        "You can handle any text task, including but not limited to:\n"
+                        "- Rewrite / rephrase / paraphrase\n"
+                        "- Make formal, casual, concise, assertive, empathetic, or humorous\n"
+                        "- Fix grammar, spelling, punctuation, or clarity\n"
+                        "- Summarise, expand, shorten, or elaborate\n"
+                        "- Convert format: bullet points, numbered list, table, paragraph, markdown, plain text\n"
+                        "- Translate to any language\n"
+                        "- Explain, simplify, or add detail\n"
+                        "- Refactor, explain, comment, or convert code\n"
+                        "- Extract key points, action items, names, dates, or any other structured data\n"
+                        "- Continue, complete, or extend a piece of text\n"
+                        "- Answer a question or generate fresh content when no text is selected\n\n"
+                        "If the command is ambiguous, make the most reasonable interpretation without asking. "
+                        "Preserve formatting of the original text unless the command explicitly changes it."
+                    )
                     if selected:
-                        content = (
+                        user_content = (
                             f"Selected text:\n{selected}\n\n"
-                            f"Command: {command}\n\n"
-                            "Apply the command to the selected text. "
-                            "Return only the result, no explanation."
+                            f"Voice command: {command}"
                         )
                     else:
-                        content = (
-                            f"Command: {command}\n\n"
-                            "Execute this command and return only the result, no explanation."
-                        )
-                messages = [{"role": "user", "content": content}]
+                        user_content = f"Voice command: {command}"
+                    messages = [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user",   "content": user_content},
+                    ]
+                    max_tok, temp = 1024, 0.4
                 prompt = g_proc.apply_chat_template(messages, add_generation_prompt=True)
                 reply = vlm_generate(g_model, g_proc, prompt=prompt,
-                                     max_tokens=512, temperature=0.3, verbose=False)
+                                     max_tokens=max_tok, temperature=temp, verbose=False)
                 _gemma_out.put(reply.text.strip())
 
         threading.Thread(target=_load_whisper, daemon=True).start()
