@@ -60,6 +60,7 @@ _audio_level  = 0.0  # RMS amplitude 0–1, written by audio callback, read by U
 
 _transcription_history   = []     # list of dicts: {time, mode, text}
 _toggle_history_callback = [None]  # called when idle pill is clicked
+_history_open            = [False] # True while the history panel is visible
 
 
 def request_accessibility():
@@ -72,23 +73,20 @@ def request_accessibility():
 # ── Floating pill widget ──────────────────────────────────────────────────────
 
 class PillView(NSView):
-    _state      = 'idle'
-    _label      = ''
-    _anim_tick  = 0
-    _pill_scale = 0.0   # 0 = small idle pill, 1 = full recording pill
-    _hovering   = False
+    _state       = 'idle'
+    _label       = ''
+    _anim_tick   = 0
+    _pill_scale  = 0.0   # 0 = small idle pill, 1 = full recording pill
+    _hovering    = False
+    _hover_scale = 0.0   # 0 = base idle size, 1 = fully expanded hover state
 
-    # ── close-button geometry (view coords, y=0 at bottom) ───────────────────
-    # Idle pill right edge: (WIN_W+60)/2 = 170. Button center: 170 + 15 = 185.
-    _CLOSE_CX = (WIN_W + 60) / 2 + 15
-    _CLOSE_CY = 11.0
-    _CLOSE_R  = 7.0
+    _CLOSE_R = 9.0
 
     def updateTrackingAreas(self):
         for area in list(self.trackingAreas()):
             self.removeTrackingArea_(area)
         bw = self.bounds().size.width
-        track_rect = NSMakeRect((bw - 60) / 2 - 5, 0, 110, 26)
+        track_rect = NSMakeRect(0, 0, bw, 36)
         area = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
             track_rect,
             NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways,
@@ -110,28 +108,38 @@ class PillView(NSView):
         if self._state != 'idle':
             return None
         bw = self.bounds().size.width
+        hs = self._hover_scale
+        pw = 45  + (160 - 45) * hs
+        ph = 8   + (28  - 8)  * hs
+        py = 8
+        px = (bw - pw) / 2
         # Close button (only when hovering)
         if self._hovering:
-            dx = point.x - self._CLOSE_CX
-            dy = point.y - self._CLOSE_CY
+            cx = px + pw + 15
+            cy = py + ph / 2
+            dx = point.x - cx
+            dy = point.y - cy
             if dx * dx + dy * dy <= self._CLOSE_R ** 2:
                 return self
-        # Pill body — expanded hit area so it's easy to click
-        px0 = (bw - 60) / 2 - 8
-        px1 = (bw + 60) / 2 + 8
-        if px0 <= point.x <= px1 and 0 <= point.y <= 24:
+        # Pill body with small padding
+        if px - 6 <= point.x <= px + pw + 6 and py - 4 <= point.y <= py + ph + 4:
             return self
         return None
 
     def mouseUp_(self, event):
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
-        # Close button
-        dx = loc.x - self._CLOSE_CX
-        dy = loc.y - self._CLOSE_CY
+        bw  = self.bounds().size.width
+        hs  = self._hover_scale
+        pw  = 90  + (160 - 90) * hs
+        ph  = 8   + (28  - 8)  * hs
+        py  = 8
+        cx  = (bw - pw) / 2 + pw + 15
+        cy  = py + ph / 2
+        dx  = loc.x - cx
+        dy  = loc.y - cy
         if self._hovering and dx * dx + dy * dy <= self._CLOSE_R ** 2:
             NSApplication.sharedApplication().terminate_(None)
             return
-        # Pill body → toggle history window
         if _toggle_history_callback[0]:
             _toggle_history_callback[0]()
 
@@ -175,14 +183,36 @@ class PillView(NSView):
                     path.fill()
 
         elif self._state == 'idle':
-            self._pill((bw - 60) / 2, 8, 60, 6, gray)
+            hs   = self._hover_scale
+            pw   = 45  + (160 - 45) * hs
+            ph   = 8   + (28  - 8)  * hs
+            py   = 8
+            px   = (bw - pw) / 2
+            path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(px, py, pw, ph), ph / 2, ph / 2
+            )
+            NSColor.colorWithRed_green_blue_alpha_(0.08, 0.08, 0.08, 1.0).set()
+            path.fill()
+            path.setLineWidth_(1.0)
+            NSColor.colorWithRed_green_blue_alpha_(0.50, 0.50, 0.52, 1.0).set()
+            path.stroke()
+            if hs > 0.25:
+                text_alpha = min(1.0, (hs - 0.25) / 0.35)
+                label = "Close history" if _history_open[0] else "History"
+                self._text(label, px + pw / 2, py + ph / 2, 12, alpha=text_alpha)
             if self._hovering:
-                cx, cy, r = self._CLOSE_CX, self._CLOSE_CY, self._CLOSE_R
-                gray.set()
-                NSBezierPath.bezierPathWithOvalInRect_(
+                cx = px + pw + 15
+                cy = py + ph / 2
+                r  = self._CLOSE_R
+                circle = NSBezierPath.bezierPathWithOvalInRect_(
                     NSMakeRect(cx - r, cy - r, r * 2, r * 2)
-                ).fill()
-                self._text('×', cx, cy, 11)
+                )
+                NSColor.colorWithRed_green_blue_alpha_(0.08, 0.08, 0.08, 1.0).set()
+                circle.fill()
+                circle.setLineWidth_(1.0)
+                NSColor.colorWithRed_green_blue_alpha_(0.50, 0.50, 0.52, 1.0).set()
+                circle.stroke()
+                self._text('×', cx, cy, 13)
 
         else:
             # active state: text label
@@ -200,10 +230,11 @@ class PillView(NSView):
         path.fill()
 
     @objc.python_method
-    def _text(self, text, x, y, size=13, bold=False):
+    def _text(self, text, x, y, size=13, bold=False, alpha=1.0):
         font = NSFont.boldSystemFontOfSize_(size) if bold else NSFont.systemFontOfSize_(size)
+        color = NSColor.colorWithRed_green_blue_alpha_(1, 1, 1, alpha)
         attrs = NSDictionary.dictionaryWithObjects_forKeys_(
-            [NSColor.whiteColor(), font],
+            [color, font],
             [NSForegroundColorAttributeName, NSFontAttributeName],
         )
         astr = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
@@ -227,6 +258,18 @@ class PillView(NSView):
             self._pill_scale = max(0.0, self._pill_scale - 0.12)  # ~400 ms collapse
             changed = True
 
+        if self._state == 'idle':
+            if self._hovering and self._hover_scale < 1.0:
+                self._hover_scale = min(1.0, self._hover_scale + 0.2)  # ~250 ms expand
+                changed = True
+            elif not self._hovering and self._hover_scale > 0.0:
+                self._hover_scale = max(0.0, self._hover_scale - 0.2)  # ~250 ms collapse
+                changed = True
+        else:
+            if self._hover_scale > 0.0:
+                self._hover_scale = 0.0
+                changed = True
+
         if changed:
             self.setNeedsDisplay_(True)
 
@@ -236,13 +279,13 @@ class _CopyButton(NSButton):
 
     def performCopy_(self, sender):
         subprocess.run(["pbcopy"], input=self._copy_text.encode())
-        self.setTitle_("Copied!")
+        self.setTitle_("✓")
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.5, self, b'resetCopyTitle:', None, False
         )
 
     def resetCopyTitle_(self, timer):
-        self.setTitle_("Copy")
+        self.setTitle_("⧉")
 
 
 class _DividerView(NSView):
@@ -251,28 +294,61 @@ class _DividerView(NSView):
         NSBezierPath.fillRect_(self.bounds())
 
 
+class _BadgeView(NSView):
+    _text  = ''
+    _color = None
+
+    def drawRect_(self, rect):
+        bw = self.bounds().size.width
+        bh = self.bounds().size.height
+        if self._color:
+            self._color.set()
+        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(0, 0, bw, bh), bh / 2, bh / 2
+        )
+        path.fill()
+        font  = NSFont.boldSystemFontOfSize_(9)
+        attrs = NSDictionary.dictionaryWithObjects_forKeys_(
+            [NSColor.whiteColor(), font],
+            [NSForegroundColorAttributeName, NSFontAttributeName],
+        )
+        astr = NSAttributedString.alloc().initWithString_attributes_(self._text, attrs)
+        sz   = astr.size()
+        astr.drawAtPoint_(NSMakePoint(bw / 2 - sz.width / 2, bh / 2 - sz.height / 2))
+
+
 class _EntryCardView(NSView):
     def drawRect_(self, rect):
         NSColor.clearColor().set()
         NSBezierPath.fillRect_(self.bounds())
-        bw = self.bounds().size.width
-        bh = self.bounds().size.height
-        NSColor.colorWithRed_green_blue_alpha_(0.96, 0.96, 0.97, 1.0).set()
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            NSMakeRect(0, 0, bw, bh), 10, 10
-        ).fill()
+        bw   = self.bounds().size.width
+        bh   = self.bounds().size.height
+        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(0.5, 0.5, bw - 1, bh - 1), 10, 10
+        )
+        NSColor.whiteColor().set()
+        path.fill()
+        path.setLineWidth_(0.5)
+        NSColor.colorWithRed_green_blue_alpha_(0.82, 0.82, 0.85, 1.0).set()
+        path.stroke()
 
 
 class _HistoryContainerView(NSView):
     def drawRect_(self, rect):
         NSColor.clearColor().set()
         NSBezierPath.fillRect_(self.bounds())
-        bw = self.bounds().size.width
-        bh = self.bounds().size.height
-        NSColor.whiteColor().set()
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        bw   = self.bounds().size.width
+        bh   = self.bounds().size.height
+        # White rounded container
+        clip = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
             NSMakeRect(0, 0, bw, bh), 16, 16
-        ).fill()
+        )
+        clip.addClip()
+        NSColor.colorWithRed_green_blue_alpha_(0.985, 0.985, 0.99, 1.0).set()
+        NSBezierPath.fillRect_(NSMakeRect(0, 0, bw, bh))
+        # Subtle header tint band at the top
+        NSColor.colorWithRed_green_blue_alpha_(0.96, 0.96, 0.975, 1.0).set()
+        NSBezierPath.fillRect_(NSMakeRect(0, bh - 52, bw, 52))
 
 
 class HistoryWindowController(NSObject):
@@ -306,9 +382,13 @@ class HistoryWindowController(NSObject):
         container = _HistoryContainerView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
         panel.setContentView_(container)
 
-        PAD = 16
+        PAD    = 16
+        HDR_H  = 48  # header zone height
+
         # Title
-        title = NSTextField.alloc().initWithFrame_(NSMakeRect(PAD, H - PAD - 20, W - 2*PAD, 20))
+        title = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(PAD, H - HDR_H + (HDR_H - 20) / 2, W - 2*PAD - 36, 20)
+        )
         title.setEditable_(False)
         title.setSelectable_(False)
         title.setBordered_(False)
@@ -318,10 +398,22 @@ class HistoryWindowController(NSObject):
         title.setTextColor_(NSColor.colorWithRed_green_blue_alpha_(0.11, 0.11, 0.13, 1.0))
         container.addSubview_(title)
 
-        # Divider below title
-        div_y = H - PAD - 20 - 9
+        # Collapse (−) button top-right
+        dash_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(W - PAD - 26, H - HDR_H + (HDR_H - 26) / 2, 26, 26)
+        )
+        dash_btn.setTitle_("−")
+        dash_btn.setBezelStyle_(12)
+        dash_btn.setButtonType_(0)
+        dash_btn.setFont_(NSFont.boldSystemFontOfSize_(16))
+        dash_btn.setTarget_(self)
+        dash_btn.setAction_(b'collapseHistory:')
+        container.addSubview_(dash_btn)
+
+        # Divider below header
+        div_y = H - HDR_H
         container.addSubview_(
-            _DividerView.alloc().initWithFrame_(NSMakeRect(PAD, div_y, W - 2*PAD, 1))
+            _DividerView.alloc().initWithFrame_(NSMakeRect(0, div_y, W, 1))
         )
 
         scroll_y = PAD
@@ -344,11 +436,17 @@ class HistoryWindowController(NSObject):
         self._content_view = content
         self._content_W    = content_w
 
+    def collapseHistory_(self, sender):
+        self._panel.orderOut_(None)
+        self._visible = False
+        _history_open[0] = False
+
     @objc.python_method
     def toggle_near_frame(self, pill_frame):
         if self._visible:
             self._panel.orderOut_(None)
             self._visible = False
+            _history_open[0] = False
             return
         W, H = self._W, self._H
         px = pill_frame.origin.x + (pill_frame.size.width - W) / 2
@@ -360,6 +458,7 @@ class HistoryWindowController(NSObject):
         self._update_content()
         self._panel.orderFrontRegardless()
         self._visible = True
+        _history_open[0] = True
 
     @objc.python_method
     def _text_height(self, text, font, width):
@@ -387,10 +486,10 @@ class HistoryWindowController(NSObject):
     def _make_copy_btn(self, copy_text, frame):
         btn = _CopyButton.alloc().initWithFrame_(frame)
         btn._copy_text = copy_text
-        btn.setTitle_("Copy")
+        btn.setTitle_("⧉")
         btn.setBezelStyle_(12)
         btn.setButtonType_(0)
-        btn.setFont_(NSFont.systemFontOfSize_(11))
+        btn.setFont_(NSFont.systemFontOfSize_(15))
         btn.setTarget_(btn)
         btn.setAction_(b'performCopy:')
         return btn
@@ -404,15 +503,16 @@ class HistoryWindowController(NSObject):
         W = self._content_W
 
         CARD_X    = 4     # outer horizontal margin inside content view
-        IV        = 12    # card vertical inner padding (top & bottom)
+        IV        = 14    # card vertical inner padding (top & bottom)
         IH        = 14    # card horizontal inner padding
-        GAP       = 8     # gap between cards
-        BTN_W     = 56
-        BTN_H     = 22
-        HEAD_H    = 16    # time + mode header row
+        GAP       = 10    # gap between cards
+        BTN_W     = 28    # copy button — square symbol button
+        BTN_H     = 26
+        HEAD_H    = 18    # time + badge header row
+        BADGE_H   = 16    # badge pill height
         ROW_H     = BTN_H # label + copy-button row height
         LABEL_H   = 13
-        DIV_TOTAL = 17    # space reserved for divider line (8 + 1 + 8)
+        DIV_TOTAL = 20    # space reserved for section divider
 
         card_w = W - 2 * CARD_X
         text_w = card_w - 2 * IH
@@ -421,10 +521,12 @@ class HistoryWindowController(NSObject):
         meta_font  = NSFont.systemFontOfSize_(11)
         label_font = NSFont.boldSystemFontOfSize_(10)
 
-        near_black = NSColor.colorWithRed_green_blue_alpha_(0.11, 0.11, 0.13, 1.0)
-        mid_gray   = NSColor.colorWithRed_green_blue_alpha_(0.53, 0.53, 0.56, 1.0)
-        blue       = NSColor.colorWithRed_green_blue_alpha_(0.20, 0.47, 0.96, 1.0)
-        orange     = NSColor.colorWithRed_green_blue_alpha_(0.85, 0.40, 0.10, 1.0)
+        near_black = NSColor.colorWithRed_green_blue_alpha_(0.10, 0.10, 0.12, 1.0)
+        mid_gray   = NSColor.colorWithRed_green_blue_alpha_(0.55, 0.55, 0.58, 1.0)
+        blue_bg    = NSColor.colorWithRed_green_blue_alpha_(0.20, 0.47, 0.96, 1.0)
+        purple_bg  = NSColor.colorWithRed_green_blue_alpha_(0.52, 0.28, 0.90, 1.0)
+        blue_text  = NSColor.colorWithRed_green_blue_alpha_(0.14, 0.38, 0.82, 1.0)
+        purple_text= NSColor.colorWithRed_green_blue_alpha_(0.44, 0.20, 0.78, 1.0)
 
         if not history:
             self._content_view.addSubview_(self._make_label(
@@ -438,13 +540,13 @@ class HistoryWindowController(NSObject):
         for entry in reversed(history):
             if entry['mode'] == 'transcribe':
                 th = self._text_height(entry['text'], body_font, text_w)
-                card_h = IV + HEAD_H + 8 + th + 6 + BTN_H + IV
+                card_h = IV + HEAD_H + 10 + th + 8 + BTN_H + IV
                 items.append((entry, card_h, {'th': th}))
             else:
                 cmd = entry.get('command', '')
                 ch  = self._text_height(cmd, body_font, text_w)
                 oh  = self._text_height(entry['text'], body_font, text_w)
-                card_h = IV + HEAD_H + 8 + ROW_H + 4 + ch + DIV_TOTAL + ROW_H + 4 + oh + IV
+                card_h = IV + HEAD_H + 10 + ROW_H + 4 + ch + DIV_TOTAL + ROW_H + 4 + oh + IV
                 items.append((entry, card_h, {'ch': ch, 'oh': oh, 'cmd': cmd}))
 
         total_h = GAP + sum(card_h + GAP for _, card_h, _ in items)
@@ -464,19 +566,23 @@ class HistoryWindowController(NSObject):
 
             y = card_h - IV  # tracks position within card, decreasing toward bottom
 
-            # Header: time (gray) + mode (colored)
-            time_str   = entry['time'].strftime("%-I:%M %p")
-            mode_str   = "Transcribe" if entry['mode'] == 'transcribe' else "Command"
-            mode_color = blue if entry['mode'] == 'transcribe' else orange
+            # Header: time (gray) + colored mode badge pill
+            time_str  = entry['time'].strftime("%-I:%M %p")
+            is_trans  = entry['mode'] == 'transcribe'
+            badge_txt = "TRANSCRIBE" if is_trans else "COMMAND"
+            badge_bg  = blue_bg if is_trans else purple_bg
+            badge_w   = 72 if is_trans else 66
             card.addSubview_(self._make_label(
                 time_str, meta_font, mid_gray,
-                NSMakeRect(IH, y - HEAD_H, 66, HEAD_H)
+                NSMakeRect(IH, y - HEAD_H + (HEAD_H - 13) / 2, 60, 13)
             ))
-            card.addSubview_(self._make_label(
-                "·  " + mode_str, meta_font, mode_color,
-                NSMakeRect(IH + 70, y - HEAD_H, 110, HEAD_H)
-            ))
-            y -= HEAD_H + 8
+            badge = _BadgeView.alloc().initWithFrame_(
+                NSMakeRect(IH + 66, y - HEAD_H + (HEAD_H - BADGE_H) / 2, badge_w, BADGE_H)
+            )
+            badge._text  = badge_txt
+            badge._color = badge_bg
+            card.addSubview_(badge)
+            y -= HEAD_H + 10
 
             if entry['mode'] == 'transcribe':
                 th = dims['th']
@@ -484,7 +590,7 @@ class HistoryWindowController(NSObject):
                     entry['text'], body_font, near_black,
                     NSMakeRect(IH, y - th, text_w, th)
                 ))
-                y -= th + 6
+                y -= th + 8
                 card.addSubview_(self._make_copy_btn(
                     entry['text'],
                     NSMakeRect(card_w - IH - BTN_W, y - BTN_H, BTN_W, BTN_H)
@@ -494,11 +600,11 @@ class HistoryWindowController(NSObject):
                 ch  = dims['ch']
                 oh  = dims['oh']
                 cmd = dims['cmd']
-                lv  = (ROW_H - LABEL_H) / 2  # vertical offset to center label in row
+                lv  = (ROW_H - LABEL_H) / 2
 
-                # Voice command section label + copy button
+                # Voice command section
                 card.addSubview_(self._make_label(
-                    "VOICE COMMAND", label_font, mid_gray,
+                    "VOICE COMMAND", label_font, purple_text,
                     NSMakeRect(IH, y - ROW_H + lv, card_w - 2*IH - BTN_W - 6, LABEL_H)
                 ))
                 card.addSubview_(self._make_copy_btn(
@@ -511,7 +617,7 @@ class HistoryWindowController(NSObject):
                 ))
                 y -= ch
 
-                # Divider
+                # Section divider
                 card.addSubview_(
                     _DividerView.alloc().initWithFrame_(
                         NSMakeRect(IH, y - DIV_TOTAL // 2, card_w - 2*IH, 1)
@@ -519,9 +625,9 @@ class HistoryWindowController(NSObject):
                 )
                 y -= DIV_TOTAL
 
-                # Output section label + copy button
+                # Output section
                 card.addSubview_(self._make_label(
-                    "OUTPUT", label_font, mid_gray,
+                    "OUTPUT", label_font, blue_text,
                     NSMakeRect(IH, y - ROW_H + lv, card_w - 2*IH - BTN_W - 6, LABEL_H)
                 ))
                 card.addSubview_(self._make_copy_btn(
