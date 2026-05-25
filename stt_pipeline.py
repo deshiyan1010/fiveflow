@@ -79,6 +79,7 @@ class PillView(NSView):
     _pill_scale  = 0.0   # 0 = small idle pill, 1 = full recording pill
     _hovering    = False
     _hover_scale = 0.0   # 0 = base idle size, 1 = fully expanded hover state
+    _did_drag    = False
 
     _CLOSE_R = 9.0
 
@@ -91,7 +92,9 @@ class PillView(NSView):
         ph  = 8   + (28  - 8)  * hs
         px  = (bw - pw) / 2
         PAD = 3
-        track_rect = NSMakeRect(px - PAD, 8 - PAD, pw + PAD * 2, ph + PAD * 2)
+        # As the pill expands, extend rightward to include the close button
+        extra = (15 + self._CLOSE_R + PAD) * hs
+        track_rect = NSMakeRect(px - PAD, 8 - PAD, pw + PAD * 2 + extra, ph + PAD * 2)
         area = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
             track_rect,
             NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways,
@@ -132,33 +135,17 @@ class PillView(NSView):
         return None
 
     def mouseDown_(self, event):
+        self._did_drag = False
+
+    def mouseDragged_(self, event):
         if self._state != 'idle':
             return
-        loc = self.convertPoint_fromView_(event.locationInWindow(), None)
-        bw  = self.bounds().size.width
-        hs  = self._hover_scale
-        pw  = 45  + (160 - 45) * hs
-        ph  = 8   + (28  - 8)  * hs
-        cx  = (bw - pw) / 2 + pw + 15
-        cy  = 8 + ph / 2
-        # Close button — let mouseUp_ handle it, don't start a drag
-        if self._hovering:
-            dx = loc.x - cx
-            dy = loc.y - cy
-            if dx * dx + dy * dy <= self._CLOSE_R ** 2:
-                return
-        # Block here while the window is being dragged
-        before = self.window().frame().origin
-        self.window().performWindowDragWithEvent_(event)
-        after  = self.window().frame().origin
-        moved  = (after.x - before.x) ** 2 + (after.y - before.y) ** 2
-        if moved < 16:
-            # Tiny movement = click → toggle history
-            if _toggle_history_callback[0]:
-                _toggle_history_callback[0]()
-        elif _history_open[0] and _toggle_history_callback[0]:
-            # Dragged to new spot → close history (now misaligned)
-            _toggle_history_callback[0]()
+        self._did_drag = True
+        origin = self.window().frame().origin
+        self.window().setFrameOrigin_(NSMakePoint(
+            origin.x + event.deltaX(),
+            origin.y - event.deltaY(),
+        ))
 
     def mouseUp_(self, event):
         if self._state != 'idle':
@@ -172,8 +159,19 @@ class PillView(NSView):
         cy  = 8 + ph / 2
         dx  = loc.x - cx
         dy  = loc.y - cy
+        # Close button
         if self._hovering and dx * dx + dy * dy <= self._CLOSE_R ** 2:
             NSApplication.sharedApplication().terminate_(None)
+            return
+        if self._did_drag:
+            # Finished dragging — close history if it was open (now misaligned)
+            if _history_open[0] and _toggle_history_callback[0]:
+                _toggle_history_callback[0]()
+        else:
+            # Clean click — toggle history
+            if _toggle_history_callback[0]:
+                _toggle_history_callback[0]()
+        self._did_drag = False
 
     def drawRect_(self, rect):
         NSColor.clearColor().set()
