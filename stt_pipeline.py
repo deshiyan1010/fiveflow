@@ -19,7 +19,7 @@ from mlx_vlm import load as vlm_load, generate as vlm_generate
 
 import Cocoa
 from Quartz import (
-    CGEventTapCreate, kCGSessionEventTap, kCGHeadInsertEventTap,
+    CGEventTapCreate, CGEventTapEnable, kCGSessionEventTap, kCGHeadInsertEventTap,
     kCGEventTapOptionDefault, CGEventMaskBit, kCGEventFlagsChanged,
     CFRunLoopAddSource, kCFRunLoopCommonModes, CFRunLoopGetMain,
     CGEventGetIntegerValueField, CGEventGetFlags,
@@ -743,6 +743,8 @@ def main():
     shift_seen   = [False]
     models_ready = [False]
     _pipe        = [None]          # set by _load_models
+    tap_ref      = [None]          # filled after CGEventTap is created
+    record_start = [0.0]           # monotonic time when recording began
     _gemma_in    = queue.Queue()
     _gemma_out   = queue.Queue()
 
@@ -828,6 +830,7 @@ def main():
             )
             stream.start()
             recording = True
+            record_start[0] = time.monotonic()
             set_widget('recording')
             print("Recording started.")
 
@@ -856,6 +859,13 @@ def main():
                 threading.Thread(target=transcribe_and_paste, args=(audio,), daemon=True).start()
 
     def fn_event_callback(proxy, event_type, event, refcon):
+        # macOS disables the tap when it times out; re-enable immediately so we
+        # never miss an Fn-release event and leave recording stuck.
+        if event_type == 0xFFFFFFFE:  # kCGEventTapDisabledByTimeout
+            if tap_ref[0]:
+                CGEventTapEnable(tap_ref[0], True)
+            return event
+
         if not models_ready[0]:
             return event
         keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
@@ -892,11 +902,24 @@ def main():
     if not tap:
         print("CGEventTap failed — ensure Accessibility permission is granted.")
         import sys; sys.exit(1)
+    tap_ref[0] = tap
     CFRunLoopAddSource(
         CFRunLoopGetMain(),
         Cocoa.CFMachPortCreateRunLoopSource(None, tap, 0),
         kCFRunLoopCommonModes,
     )
+
+    def _watchdog():
+        MAX_RECORD_SECS = 120  # force-stop if stuck recording for 2+ minutes
+        while True:
+            time.sleep(3)
+            if recording and (time.monotonic() - record_start[0]) > MAX_RECORD_SECS:
+                print("Watchdog: recording stuck — forcing stop.")
+                fn_held[0]    = False
+                shift_seen[0] = False
+                threading.Thread(target=stop_recording, args=('transcribe',), daemon=True).start()
+
+    threading.Thread(target=_watchdog, daemon=True).start()
 
     def _load_models():
         set_widget('active', 'Loading models...')
