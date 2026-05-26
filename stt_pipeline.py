@@ -679,6 +679,10 @@ class HistoryWindowController(NSObject):
 
 
 class AppDelegate(NSObject):
+    def applicationWillTerminate_(self, notification):
+        subprocess.run(["afplay", "/System/Library/Sounds/Bottle.aiff"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
     def applicationDidFinishLaunching_(self, notification):
         sf = NSScreen.mainScreen().frame()
         x = (sf.size.width - WIN_W) / 2 + sf.origin.x
@@ -857,11 +861,22 @@ def main():
                 rms = float(np.sqrt(np.mean(indata ** 2)))
                 _audio_level = min(1.0, rms * 15)
 
-            stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                callback=audio_callback,
-            )
-            stream.start()
+            # Redirect fd 2 while PortAudio initialises to suppress its
+            # error/warning output — those can contain BEL chars that ring
+            # across every open terminal window.
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            saved_fd2  = os.dup(2)
+            os.dup2(devnull_fd, 2)
+            try:
+                stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                    callback=audio_callback,
+                )
+                stream.start()
+            finally:
+                os.dup2(saved_fd2, 2)
+                os.close(saved_fd2)
+                os.close(devnull_fd)
             recording = True
             record_start[0] = time.monotonic()
             set_widget('recording')
@@ -1057,6 +1072,9 @@ def main():
         models_ready[0] = True
         set_widget('idle')
         print("Models ready. Hold Fn to record, release to transcribe.\n")
+        # Ready sound — non-blocking so UI isn't delayed
+        subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Show pill immediately, load models in background
     set_widget('active', 'Loading models...')
