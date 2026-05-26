@@ -67,33 +67,52 @@ detect_shell_rc() {
 
 SHELL_RC="$(detect_shell_rc)"
 
-# Shell function (handles paths with spaces, easier to update later)
-FUNC_BLOCK="
+# ── Shell functions ───────────────────────────────────────────────────────────
+FUNC_BLOCK='
 # fiveflow — voice STT overlay
 fiveflow() {
-    \"$INSTALL_DIR/stt_env/bin/python\" \"$INSTALL_DIR/stt_pipeline.py\"
-}"
+    "'"$INSTALL_DIR"'/stt_env/bin/python" "'"$INSTALL_DIR"'/stt_pipeline.py"
+}
+fiveflow-update() {
+    echo "[fiveflow] Pulling latest changes..."
+    git -C "'"$INSTALL_DIR"'" pull
+    echo "[fiveflow] Updating dependencies..."
+    "'"$INSTALL_DIR"'/stt_env/bin/pip" install -q --upgrade pip
+    "'"$INSTALL_DIR"'/stt_env/bin/pip" install -q -r "'"$INSTALL_DIR"'/requirements.txt"
+    echo "[fiveflow] Update complete. Run: fiveflow"
+}
+fiveflow-remove() {
+    echo "[fiveflow] Removing installation at '"$INSTALL_DIR"'..."
+    rm -rf "'"$INSTALL_DIR"'"
+    # Remove the fiveflow block from this shell config
+    perl -i -0pe '"'"'s/\n# fiveflow.*?(?=\n[^}]|\z)//s'"'"' "'"$SHELL_RC"'"
+    echo "[fiveflow] Uninstalled. Run: source '"$SHELL_RC"'"
+}'
 
-if grep -q "fiveflow()" "$SHELL_RC" 2>/dev/null; then
-    # Remove old block and rewrite
-    perl -i -0pe 's/\n# fiveflow.*?fiveflow\(\) \{.*?\}//s' "$SHELL_RC"
-    info "Updated fiveflow command in $SHELL_RC"
+# Remove any existing fiveflow block, then write fresh
+if grep -q "# fiveflow" "$SHELL_RC" 2>/dev/null; then
+    perl -i -0pe 's/\n# fiveflow — voice STT overlay\nfiveflow\(\).*?^}.*?^}.*?^}//ms' "$SHELL_RC" 2>/dev/null || true
+    info "Replacing existing fiveflow functions in $SHELL_RC"
 fi
 
-if ! grep -q "fiveflow()" "$SHELL_RC" 2>/dev/null; then
-    echo "$FUNC_BLOCK" >> "$SHELL_RC"
-    info "Added fiveflow command to $SHELL_RC"
-fi
+echo "$FUNC_BLOCK" >> "$SHELL_RC"
+info "Added fiveflow / fiveflow-update / fiveflow-remove to $SHELL_RC"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 success "Installation complete!"
 echo ""
-echo "  Reload your shell config with:"
+echo "  Reload your shell config:"
 echo "    source $SHELL_RC"
 echo ""
-echo "  Then launch fiveflow anytime with:"
+echo "  Start fiveflow:"
 echo "    fiveflow"
+echo ""
+echo "  Update to the latest version:"
+echo "    fiveflow-update"
+echo ""
+echo "  Completely uninstall:"
+echo "    fiveflow-remove"
 echo ""
 echo "  On first launch, grant Accessibility permission when prompted."
 echo "  The pill will appear once models finish loading (~30–60 s first time)."

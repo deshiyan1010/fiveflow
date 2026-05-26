@@ -67,7 +67,13 @@ source ~/.zshrc   # or ~/.bash_profile if using bash
 fiveflow
 ```
 
-Running `fiveflow` again in the future will always start the app. Re-running the install script at any time will update to the latest version.
+The install script registers three commands in your shell:
+
+| Command | What it does |
+|---------|-------------|
+| `fiveflow` | Start the app |
+| `fiveflow-update` | Pull the latest version and update dependencies |
+| `fiveflow-remove` | Completely uninstall — deletes `~/.fiveflow` and removes all shell commands |
 
 On first run, if the models are not yet cached, you will be prompted for a Hugging Face token. A token is optional but significantly speeds up the download.
 
