@@ -768,7 +768,106 @@ def _prompt_hf_token_if_needed():
         print("⚠  Warning: downloading without a token will be very slow.\n")
 
 
+def ask_yes_no_arrow(prompt):
+    import sys
+    import tty
+    import termios
+    
+    print(prompt)
+    choice = True
+    
+    def draw():
+        sys.stdout.write("\r\033[K")  # Clear current line
+        if choice:
+            sys.stdout.write("  \033[1m\033[36m❯ Yes\033[0m    No ")
+        else:
+            sys.stdout.write("    Yes  \033[1m\033[36m❯ No\033[0m  ")
+        sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        # Fallback if termios is not supported/non-tty
+        try:
+            res = input(" (Yes/No) [y/N]: ").strip().lower()
+            return res in ('y', 'yes')
+        except (KeyboardInterrupt, EOFError):
+            return False
+
+    try:
+        tty.setraw(fd)
+        draw()
+        while True:
+            ch1 = sys.stdin.read(1)
+            if ch1 in ('\r', '\n'):
+                break
+            elif ch1.lower() == 'y':
+                choice = True
+                draw()
+            elif ch1.lower() == 'n':
+                choice = False
+                draw()
+            elif ch1 == '\033':  # Escape sequence for arrow keys
+                ch2 = sys.stdin.read(1)
+                if ch2 == '[':
+                    ch3 = sys.stdin.read(1)
+                    if ch3 in ('A', 'D'):  # Up / Left
+                        choice = True
+                    elif ch3 in ('B', 'C'):  # Down / Right
+                        choice = False
+                    draw()
+    except (KeyboardInterrupt, EOFError):
+        choice = False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    print()  # New line after selection
+    return choice
+
+
+def check_for_updates():
+    import sys
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.exists(os.path.join(script_dir, ".git")):
+        return
+
+    print("[fiveflow] Checking for updates...")
+    try:
+        # Fetch origin
+        subprocess.run(["git", "-C", script_dir, "fetch", "origin", "--quiet"],
+                       timeout=5.0, capture_output=True, check=True)
+        
+        # Get hashes
+        local_hash = subprocess.run(["git", "-C", script_dir, "rev-parse", "HEAD"],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+        remote_hash = subprocess.run(["git", "-C", script_dir, "rev-parse", "origin/master"],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+        
+        if local_hash != remote_hash:
+            behind = subprocess.run(["git", "-C", script_dir, "log", f"{local_hash}..{remote_hash}", "--oneline"],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+            if behind:
+                prompt = "\n[fiveflow] A new update is available! Would you like to upgrade now?"
+                if ask_yes_no_arrow(prompt):
+                    print("[fiveflow] Upgrading to the latest version...")
+                    subprocess.run(["git", "-C", script_dir, "reset", "--hard", "origin/master"], check=True)
+                    
+                    pip_path = os.path.join(os.path.dirname(sys.executable), "pip")
+                    req_path = os.path.join(script_dir, "requirements.txt")
+                    if os.path.exists(pip_path) and os.path.exists(req_path):
+                        print("[fiveflow] Updating dependencies...")
+                        subprocess.run([pip_path, "install", "-q", "-r", req_path], check=True)
+                    
+                    print("[fiveflow] Upgrade complete! Restarting...")
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                else:
+                    print("[fiveflow] Update skipped.")
+    except Exception as e:
+        print(f"[fiveflow] Could not check for updates: {e}")
+
+
 def main():
+    check_for_updates()
     request_accessibility()
     _prompt_hf_token_if_needed()
 

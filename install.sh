@@ -70,14 +70,27 @@ detect_shell_rc() {
 }
 SHELL_RC="$(detect_shell_rc)"
 
+# ── Check if SHELL_RC is writable ─────────────────────────────────────────────
+IS_WRITABLE=true
+if [ -f "$SHELL_RC" ] && [ ! -w "$SHELL_RC" ]; then
+    IS_WRITABLE=false
+elif [ ! -f "$SHELL_RC" ] && [ ! -w "$(dirname "$SHELL_RC")" ]; then
+    IS_WRITABLE=false
+fi
+
 # ── Remove any existing fiveflow block (sentinel-based) ──────────────────────
 if grep -q "# >>> fiveflow >>>" "$SHELL_RC" 2>/dev/null; then
-    sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
+    if [ "$IS_WRITABLE" = true ]; then
+        sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
+    else
+        warn "$SHELL_RC is not writable. Requesting sudo to update configuration..."
+        sudo sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
+    fi
     info "Replacing existing fiveflow functions in $SHELL_RC"
 fi
 
 # ── Write shell functions with sentinels ─────────────────────────────────────
-cat >> "$SHELL_RC" << SHELL_BLOCK
+BLOCK_CONTENT=$(cat << SHELL_BLOCK
 
 # >>> fiveflow >>>
 fiveflow() {
@@ -100,11 +113,23 @@ fiveflow-remove() {
     rm -rf "$WHISPER_CACHE"
     rm -rf "$GEMMA_CACHE"
     # Shell functions
-    sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
+    if [ -w "$SHELL_RC" ]; then
+        sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
+    else
+        sudo sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
+    fi
     echo "[fiveflow] Fully removed. Run: source $SHELL_RC"
 }
 # <<< fiveflow <<<
 SHELL_BLOCK
+)
+
+if [ "$IS_WRITABLE" = true ]; then
+    echo "$BLOCK_CONTENT" >> "$SHELL_RC"
+else
+    warn "$SHELL_RC is not writable. Writing configuration with sudo..."
+    echo "$BLOCK_CONTENT" | sudo tee -a "$SHELL_RC" >/dev/null
+fi
 
 info "Added fiveflow / fiveflow-update / fiveflow-remove to $SHELL_RC"
 
