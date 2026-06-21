@@ -209,10 +209,9 @@ class Pipeline:
         )
 
     def _watchdog(self):
-        MAX_RECORD_SECS = 120
         while True:
-            time.sleep(3)
-            if self._recording and (time.monotonic() - self._record_start[0]) > MAX_RECORD_SECS:
+            time.sleep(5)
+            if self._recording and (time.monotonic() - self._record_start[0]) > 30:
                 print("Watchdog: recording stuck - forcing stop.")
                 self._fn_held[0]    = False
                 self._shift_seen[0] = False
