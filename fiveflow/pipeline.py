@@ -18,7 +18,7 @@ from Quartz import (
     CGEventTapCreate, CGEventTapEnable, kCGSessionEventTap, kCGHeadInsertEventTap,
     kCGEventTapOptionDefault, CGEventMaskBit, kCGEventFlagsChanged,
     CFRunLoopAddSource, kCFRunLoopCommonModes, CFRunLoopGetMain,
-    CGEventGetIntegerValueField, CGEventGetFlags,
+    CGEventGetIntegerValueField, CGEventGetFlags, CGEventCreate,
 )
 
 from . import state
@@ -40,7 +40,7 @@ class Pipeline:
         self._models_ready = [False]
         self._pipe         = [None]
         self._tap_ref      = [None]
-        self._record_start = [0.0]
+        self._fn_poller    = [None]
         self._gemma_in     = queue.Queue()
         self._gemma_out    = queue.Queue()
 
@@ -133,9 +133,9 @@ class Pipeline:
                 os.close(saved_fd2)
                 os.close(devnull_fd)
             self._recording = True
-            self._record_start[0] = time.monotonic()
             set_widget('recording')
             print("Recording started.")
+            self._start_fn_poller()
 
     def stop_recording(self, mode='transcribe'):
         selected = self.get_selected_text() if mode == 'command' else ''
@@ -208,15 +208,24 @@ class Pipeline:
             kCFRunLoopCommonModes,
         )
 
-    def _watchdog(self):
-        MAX_RECORD_SECS = 120
-        while True:
-            time.sleep(3)
-            if self._recording and (time.monotonic() - self._record_start[0]) > MAX_RECORD_SECS:
-                print("Watchdog: recording stuck - forcing stop.")
-                self._fn_held[0]    = False
-                self._shift_seen[0] = False
-                threading.Thread(target=self.stop_recording, args=('transcribe',), daemon=True).start()
+    def _start_fn_poller(self):
+        def _poll():
+            while self._recording:
+                time.sleep(0.05)
+                flags = CGEventGetFlags(CGEventCreate(None))
+                fn_now = bool(flags & kCGEventFlagMaskSecondaryFn)
+                sh_now = bool(flags & kCGEventFlagMaskShift)
+                if sh_now:
+                    self._shift_seen[0] = True
+                if not fn_now and self._fn_held[0]:
+                    self._fn_held[0]    = False
+                    shift_seen = self._shift_seen[0]
+                    self._shift_seen[0] = False
+                    mode = 'command' if shift_seen else 'transcribe'
+                    threading.Thread(target=self.stop_recording, args=(mode,), daemon=True).start()
+                    return
+        self._fn_poller[0] = threading.Thread(target=_poll, daemon=True)
+        self._fn_poller[0].start()
 
     def load_models(self):
         set_widget('active', 'Loading models...')
@@ -324,7 +333,6 @@ class Pipeline:
 
     def run(self):
         self.setup_event_tap()
-        threading.Thread(target=self._watchdog, daemon=True).start()
         set_widget('active', 'Loading models...')
         threading.Thread(target=self.load_models, daemon=True).start()
 
