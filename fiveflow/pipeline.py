@@ -35,8 +35,8 @@ class Pipeline:
         self._frames       = []
         self._stream       = None
         self._lock         = threading.Lock()
-        self._fn_held      = [False]
-        self._shift_seen   = [False]
+        self._fn_pressed   = False
+        self._shift_held   = False
         self._models_ready = [False]
         self._pipe         = [None]
         self._tap_ref      = [None]
@@ -108,55 +108,106 @@ class Pipeline:
         time.sleep(1.5)
         set_widget('idle')
 
-    def start_recording(self):
-        with self._lock:
-            if self._recording:
-                return
-            self._frames = []
+    def _open_audio_stream(self):
+        self._frames = []
 
-            def audio_callback(indata, _frame_count, _time_info, _status):
-                self._frames.append(indata.copy())
-                rms = float(np.sqrt(np.mean(indata ** 2)))
-                state.audio_level = min(1.0, rms * 15)
+        def audio_callback(indata, _frame_count, _time_info, _status):
+            self._frames.append(indata.copy())
+            rms = float(np.sqrt(np.mean(indata ** 2)))
+            state.audio_level = min(1.0, rms * 15)
 
-            devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            saved_fd2  = os.dup(2)
-            os.dup2(devnull_fd, 2)
-            try:
-                self._stream = sd.InputStream(
-                    samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                    callback=audio_callback,
-                )
-                self._stream.start()
-            finally:
-                os.dup2(saved_fd2, 2)
-                os.close(saved_fd2)
-                os.close(devnull_fd)
-            self._recording = True
-            self._record_start[0] = time.monotonic()
-            set_widget('recording')
-            print("Recording started.")
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_fd2  = os.dup(2)
+        os.dup2(devnull_fd, 2)
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                callback=audio_callback,
+            )
+            self._stream.start()
+        finally:
+            os.dup2(saved_fd2, 2)
+            os.close(saved_fd2)
+            os.close(devnull_fd)
+        self._recording = True
+        self._record_start[0] = time.monotonic()
+        set_widget('recording')
 
-    def stop_recording(self, mode='transcribe'):
-        selected = self.get_selected_text() if mode == 'command' else ''
-        with self._lock:
-            if not self._recording:
-                return
-            self._stream.stop()
-            self._stream.close()
-            state.audio_level = 0.0
-            self._recording = False
-            print(f"Recording stopped. mode={mode} selected={selected!r}")
-            audio = np.concatenate(self._frames, axis=0).squeeze()
-            if len(audio) < SAMPLE_RATE:
-                set_widget('active', 'Too short')
-                time.sleep(2)
-                set_widget('idle')
-                return
+    def _close_audio_stream(self):
+        self._stream.stop()
+        self._stream.close()
+        state.audio_level = 0.0
+        self._recording = False
+
+    def _process_audio(self, audio, mode):
+        if len(audio) >= SAMPLE_RATE:
             if mode == 'command':
-                threading.Thread(target=self.command_and_paste, args=(audio, selected), daemon=True).start()
+                threading.Thread(target=self.command_and_paste, args=(audio, self.get_selected_text()), daemon=True).start()
             else:
                 threading.Thread(target=self.transcribe_and_paste, args=(audio,), daemon=True).start()
+        else:
+            set_widget('active', 'Too short')
+            time.sleep(2)
+            set_widget('idle')
+
+    def _recording_controller(self):
+        fn_was_down    = False
+        shift_seen     = False
+        debounce_until = 0.0
+
+        while True:
+            time.sleep(0.01)
+
+            if not self._models_ready[0]:
+                continue
+
+            fn_down = self._fn_pressed
+            sh_down = self._shift_held
+            now     = time.monotonic()
+
+            if fn_down and not fn_was_down:
+                if now < debounce_until:
+                    fn_was_down = fn_down
+                    continue
+                debounce_until = now + 0.08
+
+                action = None
+                with self._lock:
+                    if not self._recording:
+                        self._open_audio_stream()
+                        shift_seen = sh_down
+                        print("Recording started.")
+                    else:
+                        mode = 'command' if shift_seen else 'transcribe'
+                        self._close_audio_stream()
+                        print(f"Recording stopped (toggle). mode={mode}")
+                        audio = np.concatenate(self._frames, axis=0).squeeze()
+                        shift_seen = False
+                        action = ('process', audio, mode)
+
+                if action:
+                    self._process_audio(action[1], action[2])
+
+            elif fn_down and fn_was_down:
+                if sh_down:
+                    shift_seen = True
+
+            elif not fn_down and fn_was_down:
+                debounce_until = now + 0.08
+                action = None
+                with self._lock:
+                    if self._recording:
+                        mode = 'command' if shift_seen else 'transcribe'
+                        self._close_audio_stream()
+                        print(f"Recording stopped. mode={mode}")
+                        audio = np.concatenate(self._frames, axis=0).squeeze()
+                        shift_seen = False
+                        action = ('process', audio, mode)
+
+                if action:
+                    self._process_audio(action[1], action[2])
+
+            fn_was_down = fn_down
 
     def fn_event_callback(self, proxy, event_type, event, refcon):
         if event_type == 0xFFFFFFFE:
@@ -164,30 +215,17 @@ class Pipeline:
                 CGEventTapEnable(self._tap_ref[0], True)
             return event
 
-        if not self._models_ready[0]:
-            return event
         keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-        flags   = CGEventGetFlags(event)
-        fn_now  = bool(flags & kCGEventFlagMaskSecondaryFn)
-        sh_now  = bool(flags & kCGEventFlagMaskShift)
+        if keycode != 63:
+            return event
 
-        if keycode == 63 and fn_now and not self._fn_held[0]:
-            self._fn_held[0]    = True
-            self._shift_seen[0] = sh_now
-            threading.Thread(target=self.start_recording, daemon=True).start()
-            return None
+        flags  = CGEventGetFlags(event)
+        fn_now = bool(flags & kCGEventFlagMaskSecondaryFn)
+        sh_now = bool(flags & kCGEventFlagMaskShift)
 
-        if self._fn_held[0] and sh_now:
-            self._shift_seen[0] = True
-
-        if self._fn_held[0] and not fn_now:
-            mode = 'command' if self._shift_seen[0] else 'transcribe'
-            self._fn_held[0]    = False
-            self._shift_seen[0] = False
-            threading.Thread(target=self.stop_recording, args=(mode,), daemon=True).start()
-            return None
-
-        return event
+        self._fn_pressed = fn_now
+        self._shift_held = sh_now
+        return None
 
     def setup_event_tap(self):
         tap = CGEventTapCreate(
@@ -213,9 +251,7 @@ class Pipeline:
             time.sleep(5)
             if self._recording and (time.monotonic() - self._record_start[0]) > 30:
                 print("Watchdog: recording stuck - forcing stop.")
-                self._fn_held[0]    = False
-                self._shift_seen[0] = False
-                threading.Thread(target=self.stop_recording, args=('transcribe',), daemon=True).start()
+                self._fn_pressed = False
 
     def load_models(self):
         set_widget('active', 'Loading models...')
@@ -316,6 +352,7 @@ class Pipeline:
                 set_widget('active', 'Loading Whisper...')
 
         self._models_ready[0] = True
+        self._fn_pressed = False
         set_widget('idle')
         print("Models ready. Hold Fn to record, release to transcribe.\n")
         subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
@@ -324,6 +361,7 @@ class Pipeline:
     def run(self):
         self.setup_event_tap()
         threading.Thread(target=self._watchdog, daemon=True).start()
+        threading.Thread(target=self._recording_controller, daemon=True).start()
         set_widget('active', 'Loading models...')
         threading.Thread(target=self.load_models, daemon=True).start()
 
