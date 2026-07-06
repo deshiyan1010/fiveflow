@@ -9,8 +9,17 @@ import datetime
 import numpy as np
 import sounddevice as sd
 import torch
+from transformers import AutoTokenizer, AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+# Mock AutoTokenizer.register to prevent crash in mlx_lm with transformers >= 5.13
+_original_register = AutoTokenizer.register
+def _safe_register(config_class, *args, **kwargs):
+    if isinstance(config_class, str):
+        return
+    return _original_register(config_class, *args, **kwargs)
+AutoTokenizer.register = _safe_register
+
 from mlx_vlm import load as vlm_load, generate as vlm_generate
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from pynput.keyboard import Key, Controller as KeyboardController
 
 import Cocoa
