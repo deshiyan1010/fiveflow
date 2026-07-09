@@ -28,6 +28,7 @@ from Quartz import (
     kCGEventTapOptionDefault, CGEventMaskBit, kCGEventFlagsChanged,
     CFRunLoopAddSource, kCFRunLoopCommonModes, CFRunLoopGetMain,
     CGEventGetIntegerValueField, CGEventGetFlags,
+    CGEventSourceKeyState, kCGEventSourceStateHIDSystemState,
 )
 
 from . import state
@@ -170,7 +171,7 @@ class Pipeline:
             if not self._models_ready[0]:
                 continue
 
-            fn_down = self._fn_pressed
+            fn_down = CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, 63)
             sh_down = self._shift_held
             now     = time.monotonic()
 
@@ -254,13 +255,6 @@ class Pipeline:
             Cocoa.CFMachPortCreateRunLoopSource(None, tap, 0),
             kCFRunLoopCommonModes,
         )
-
-    def _watchdog(self):
-        while True:
-            time.sleep(5)
-            if self._recording and (time.monotonic() - self._record_start[0]) > 30:
-                print("Watchdog: recording stuck - forcing stop.")
-                self._fn_pressed = False
 
     def load_models(self):
         set_widget('active', 'Loading models...')
@@ -369,7 +363,6 @@ class Pipeline:
 
     def run(self):
         self.setup_event_tap()
-        threading.Thread(target=self._watchdog, daemon=True).start()
         threading.Thread(target=self._recording_controller, daemon=True).start()
         set_widget('active', 'Loading models...')
         threading.Thread(target=self.load_models, daemon=True).start()
