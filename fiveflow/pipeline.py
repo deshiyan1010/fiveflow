@@ -226,7 +226,13 @@ class Pipeline:
                     mode = 'command' if self._command_mode or shift_held else 'transcribe'
                     self._close_audio_stream()
                     print(f"Recording stopped. mode={mode}")
-                    audio = np.concatenate(self._frames, axis=0).squeeze()
+                    # A quick release can happen before SoundDevice invokes its
+                    # first callback. Treat that as an empty, too-short capture.
+                    audio = (
+                        np.concatenate(self._frames, axis=0).squeeze()
+                        if self._frames
+                        else np.empty(0, dtype=np.float32)
+                    )
                     self._command_mode = False
                     action = ('process', audio, mode)
 
