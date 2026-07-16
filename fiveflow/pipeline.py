@@ -27,7 +27,8 @@ from Quartz import (
     CGEventTapCreate, CGEventTapEnable, kCGSessionEventTap, kCGHeadInsertEventTap,
     kCGEventTapOptionDefault, CGEventMaskBit, kCGEventFlagsChanged,
     CFRunLoopAddSource, kCFRunLoopCommonModes, CFRunLoopGetMain,
-    CGEventGetIntegerValueField, CGEventGetFlags,
+    CGEventGetIntegerValueField, CGEventGetFlags, CGEventSourceFlagsState,
+    CGEventSourceKeyState, kCGEventSourceStateCombinedSessionState,
     kCGEventKeyDown, kCGEventKeyUp,
 )
 
@@ -56,6 +57,48 @@ class Pipeline:
         self._trigger_events = queue.Queue()
         self._trigger_is_down = False
         self._command_mode = False
+
+    @staticmethod
+    def _modifier_mask_for_keycode(keycode):
+        return {
+            54: 0x00100000, 55: 0x00100000,  # Command
+            56: kCGEventFlagMaskShift, 60: kCGEventFlagMaskShift,
+            57: 0x00010000,                  # Caps Lock
+            58: 0x00080000, 61: 0x00080000,  # Option
+            59: 0x00040000, 62: 0x00040000,  # Control
+            63: kCGEventFlagMaskSecondaryFn,
+        }.get(keycode)
+
+    def _set_trigger_pressed(self, pressed, shift_held=None):
+        """Queue a trigger transition once, regardless of its source."""
+        if pressed == self._trigger_is_down:
+            return
+        self._trigger_is_down = pressed
+        if shift_held is None:
+            shift_held = bool(
+                CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
+                & kCGEventFlagMaskShift
+            )
+        self._trigger_events.put((pressed, shift_held))
+
+    def _trigger_is_physically_down(self):
+        keycode = state.transcribe_keycode
+        modifier_mask = self._modifier_mask_for_keycode(keycode)
+        if modifier_mask is not None:
+            flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
+            return bool(flags & modifier_mask)
+        return bool(CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, keycode))
+
+    def _watch_trigger_release(self):
+        """Recover when macOS drops a key-up event while the event tap is disabled."""
+        while True:
+            if (
+                self._trigger_is_down
+                and not state.listening_for_key
+                and not self._trigger_is_physically_down()
+            ):
+                self._set_trigger_pressed(False)
+            time.sleep(0.05)
 
     def paste_at_cursor(self, text):
         original = subprocess.run(["pbpaste"], capture_output=True).stdout
@@ -147,10 +190,14 @@ class Pipeline:
         set_widget('recording')
 
     def _close_audio_stream(self):
-        self._stream.stop()
-        self._stream.close()
-        state.audio_level = 0.0
-        self._recording = False
+        stream, self._stream = self._stream, None
+        try:
+            if stream is not None:
+                stream.stop()
+                stream.close()
+        finally:
+            state.audio_level = 0.0
+            self._recording = False
 
     def _process_audio(self, audio, mode):
         if len(audio) >= SAMPLE_RATE:
@@ -187,9 +234,12 @@ class Pipeline:
                 self._process_audio(action[1], action[2])
 
     def fn_event_callback(self, proxy, event_type, event, refcon):
-        if event_type == 0xFFFFFFFE:
+        if event_type in (0xFFFFFFFE, 0xFFFFFFFD):
             if self._tap_ref[0]:
                 CGEventTapEnable(self._tap_ref[0], True)
+            # A key-up event may have occurred while the tap was disabled.
+            if self._trigger_is_down and not self._trigger_is_physically_down():
+                self._set_trigger_pressed(False)
             return event
 
         keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
@@ -213,25 +263,14 @@ class Pipeline:
             return event
 
         if event_type == kCGEventKeyDown and not self._trigger_is_down:
-            self._trigger_is_down = True
-            self._trigger_events.put((True, self._shift_held))
+            self._set_trigger_pressed(True, self._shift_held)
         elif event_type == kCGEventKeyUp and self._trigger_is_down:
-            self._trigger_is_down = False
-            self._trigger_events.put((False, self._shift_held))
+            self._set_trigger_pressed(False, self._shift_held)
         elif event_type == kCGEventFlagsChanged:
             # Modifier keys, including Fn, do not emit key down/up events.
-            modifier_masks = {
-                54: 0x00100000, 55: 0x00100000,  # Command
-                56: kCGEventFlagMaskShift, 60: kCGEventFlagMaskShift,
-                57: 0x00010000,                  # Caps Lock
-                58: 0x00080000, 61: 0x00080000,  # Option
-                59: 0x00040000, 62: 0x00040000,  # Control
-                63: kCGEventFlagMaskSecondaryFn,
-            }
-            is_down = bool(flags & modifier_masks.get(keycode, 0))
-            if is_down != self._trigger_is_down:
-                self._trigger_is_down = is_down
-                self._trigger_events.put((is_down, self._shift_held))
+            modifier_mask = self._modifier_mask_for_keycode(keycode)
+            if modifier_mask is not None:
+                self._set_trigger_pressed(bool(flags & modifier_mask), self._shift_held)
         return None
 
     def setup_event_tap(self):
@@ -361,6 +400,7 @@ class Pipeline:
     def run(self):
         self.setup_event_tap()
         threading.Thread(target=self._recording_controller, daemon=True).start()
+        threading.Thread(target=self._watch_trigger_release, daemon=True).start()
         set_widget('active', 'Loading models...')
         threading.Thread(target=self.load_models, daemon=True).start()
 

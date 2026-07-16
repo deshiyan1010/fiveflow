@@ -23,7 +23,7 @@ A floating pill widget lives at the bottom of your screen. Drag it anywhere. It 
 - **Draggable pill** — Click and drag the pill to reposition it anywhere on screen.
 - **Parallel model loading** — Whisper (MPS) and Gemma (MLX) load simultaneously at startup.
 - **Fully transparent overlay** — Click-through everywhere except the pill itself; never steals focus.
-- **Stuck-recording protection** — CGEventTap is automatically re-enabled if macOS times it out, and a watchdog force-stops any recording stuck for over 2 minutes.
+- **Stuck-recording protection** — If macOS disables the event tap and drops a release event, Fiveflow re-enables the tap and checks the physical key state to stop recording.
 
 ## Command capabilities
 
@@ -119,7 +119,7 @@ _gemma_worker        Loads Gemma and handles all inference — MLX GPU
 stop_recording       Stops audio stream, grabs selected text in command mode
 transcribe_and_paste Whisper → Gemma punctuation fix → paste
 command_and_paste    Whisper → Gemma command execution → paste
-_watchdog            Monitors recording duration; force-stops if stuck >120 s
+_watch_trigger_release Reconciles the actual key state if macOS drops a release event
 ```
 
 ## License
