@@ -14,6 +14,8 @@ from ..config import WIN_W, WIN_H, NSBorderlessWindowMask, NSNonactivatingPanelM
 from .widgets import PillView, set_widget
 from .history import HistoryWindowController
 
+import logging
+
 
 class AppDelegate(NSObject):
     def applicationWillTerminate_(self, notification):
@@ -56,5 +58,6 @@ class AppDelegate(NSObject):
 
         pill_panel = self._panel
         def _toggle_history():
+            logging.debug("AppDelegate._toggle_history: called")
             history_ctrl.toggle_near_frame(pill_panel.frame())
         state.toggle_history_callback[0] = _toggle_history

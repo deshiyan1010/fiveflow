@@ -28,7 +28,7 @@ from Quartz import (
     kCGEventTapOptionDefault, CGEventMaskBit, kCGEventFlagsChanged,
     CFRunLoopAddSource, kCFRunLoopCommonModes, CFRunLoopGetMain,
     CGEventGetIntegerValueField, CGEventGetFlags,
-    CGEventSourceKeyState, kCGEventSourceStateHIDSystemState,
+    kCGEventKeyDown, kCGEventKeyUp,
 )
 
 from . import state
@@ -53,6 +53,9 @@ class Pipeline:
         self._record_start = [0.0]
         self._gemma_in     = queue.Queue()
         self._gemma_out    = queue.Queue()
+        self._trigger_events = queue.Queue()
+        self._trigger_is_down = False
+        self._command_mode = False
 
     def paste_at_cursor(self, text):
         original = subprocess.run(["pbpaste"], capture_output=True).stdout
@@ -161,63 +164,27 @@ class Pipeline:
             set_widget('idle')
 
     def _recording_controller(self):
-        fn_was_down    = False
-        shift_seen     = False
-        debounce_until = 0.0
-
         while True:
-            time.sleep(0.01)
-
+            pressed, shift_held = self._trigger_events.get()
             if not self._models_ready[0]:
                 continue
 
-            fn_down = CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, 63)
-            sh_down = self._shift_held
-            now     = time.monotonic()
+            action = None
+            with self._lock:
+                if pressed and not self._recording:
+                    self._open_audio_stream()
+                    self._command_mode = shift_held
+                    print("Recording started.")
+                elif not pressed and self._recording:
+                    mode = 'command' if self._command_mode or shift_held else 'transcribe'
+                    self._close_audio_stream()
+                    print(f"Recording stopped. mode={mode}")
+                    audio = np.concatenate(self._frames, axis=0).squeeze()
+                    self._command_mode = False
+                    action = ('process', audio, mode)
 
-            if fn_down and not fn_was_down:
-                if now < debounce_until:
-                    fn_was_down = fn_down
-                    continue
-                debounce_until = now + 0.08
-
-                action = None
-                with self._lock:
-                    if not self._recording:
-                        self._open_audio_stream()
-                        shift_seen = sh_down
-                        print("Recording started.")
-                    else:
-                        mode = 'command' if shift_seen else 'transcribe'
-                        self._close_audio_stream()
-                        print(f"Recording stopped (toggle). mode={mode}")
-                        audio = np.concatenate(self._frames, axis=0).squeeze()
-                        shift_seen = False
-                        action = ('process', audio, mode)
-
-                if action:
-                    self._process_audio(action[1], action[2])
-
-            elif fn_down and fn_was_down:
-                if sh_down:
-                    shift_seen = True
-
-            elif not fn_down and fn_was_down:
-                debounce_until = now + 0.08
-                action = None
-                with self._lock:
-                    if self._recording:
-                        mode = 'command' if shift_seen else 'transcribe'
-                        self._close_audio_stream()
-                        print(f"Recording stopped. mode={mode}")
-                        audio = np.concatenate(self._frames, axis=0).squeeze()
-                        shift_seen = False
-                        action = ('process', audio, mode)
-
-                if action:
-                    self._process_audio(action[1], action[2])
-
-            fn_was_down = fn_down
+            if action:
+                self._process_audio(action[1], action[2])
 
     def fn_event_callback(self, proxy, event_type, event, refcon):
         if event_type == 0xFFFFFFFE:
@@ -226,15 +193,45 @@ class Pipeline:
             return event
 
         keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-        if keycode != 63:
+        flags = CGEventGetFlags(event)
+        self._shift_held = bool(flags & kCGEventFlagMaskShift)
+
+        if state.listening_for_key:
+            if event_type in (kCGEventKeyDown, kCGEventFlagsChanged):
+                state.transcribe_keycode = keycode
+                state.listening_for_key = False
+                self._trigger_is_down = False
+                print(f"New trigger key set: {keycode}")
+                if callable(state.on_key_assigned):
+                    state.on_key_assigned(keycode)
+                return None
             return event
 
-        flags  = CGEventGetFlags(event)
-        fn_now = bool(flags & kCGEventFlagMaskSecondaryFn)
-        sh_now = bool(flags & kCGEventFlagMaskShift)
+        if keycode != state.transcribe_keycode:
+            if self._recording and self._shift_held:
+                self._command_mode = True
+            return event
 
-        self._fn_pressed = fn_now
-        self._shift_held = sh_now
+        if event_type == kCGEventKeyDown and not self._trigger_is_down:
+            self._trigger_is_down = True
+            self._trigger_events.put((True, self._shift_held))
+        elif event_type == kCGEventKeyUp and self._trigger_is_down:
+            self._trigger_is_down = False
+            self._trigger_events.put((False, self._shift_held))
+        elif event_type == kCGEventFlagsChanged:
+            # Modifier keys, including Fn, do not emit key down/up events.
+            modifier_masks = {
+                54: 0x00100000, 55: 0x00100000,  # Command
+                56: kCGEventFlagMaskShift, 60: kCGEventFlagMaskShift,
+                57: 0x00010000,                  # Caps Lock
+                58: 0x00080000, 61: 0x00080000,  # Option
+                59: 0x00040000, 62: 0x00040000,  # Control
+                63: kCGEventFlagMaskSecondaryFn,
+            }
+            is_down = bool(flags & modifier_masks.get(keycode, 0))
+            if is_down != self._trigger_is_down:
+                self._trigger_is_down = is_down
+                self._trigger_events.put((is_down, self._shift_held))
         return None
 
     def setup_event_tap(self):
@@ -242,7 +239,7 @@ class Pipeline:
             kCGSessionEventTap,
             kCGHeadInsertEventTap,
             kCGEventTapOptionDefault,
-            CGEventMaskBit(kCGEventFlagsChanged),
+            CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp),
             self.fn_event_callback,
             None,
         )

@@ -14,6 +14,9 @@ from Foundation import NSObject, NSTimer, NSMakeRect, NSMakePoint, NSDictionary
 from .. import state
 from ..config import WIN_W, WIN_H
 
+import logging
+logging.basicConfig(filename='/tmp/fiveflow_debug.log', level=logging.DEBUG, format='%(asctime)s %(levelname)s:%(message)s')
+
 
 class PillView(NSView):
     _state       = 'idle'
@@ -25,6 +28,9 @@ class PillView(NSView):
     _did_drag    = False
 
     _CLOSE_R = 9.0
+
+    def acceptsFirstMouse_(self, event):
+        return True
 
     def updateTrackingAreas(self):
         for area in list(self.trackingAreas()):
@@ -88,6 +94,7 @@ class PillView(NSView):
         ))
 
     def mouseUp_(self, event):
+        logging.debug(f"PillView mouseUp_: state={self._state}, did_drag={self._did_drag}")
         if self._state != 'idle':
             return
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
@@ -100,14 +107,20 @@ class PillView(NSView):
         dx  = loc.x - cx
         dy  = loc.y - cy
         if self._hovering and dx * dx + dy * dy <= self._CLOSE_R ** 2:
+            logging.debug("PillView mouseUp_: clicked close button")
             from AppKit import NSApplication
             NSApplication.sharedApplication().terminate_(None)
             return
+        
+        logging.debug(f"PillView mouseUp_: checking toggle callback. callback exists: {state.toggle_history_callback[0] is not None}")
+        
         if self._did_drag:
             if state.history_open[0] and state.toggle_history_callback[0]:
+                logging.debug("PillView mouseUp_: invoking toggle callback after drag")
                 state.toggle_history_callback[0]()
         else:
             if state.toggle_history_callback[0]:
+                logging.debug("PillView mouseUp_: invoking toggle callback")
                 state.toggle_history_callback[0]()
         self._did_drag = False
 
@@ -282,7 +295,7 @@ class BadgeView(NSView):
         )
         astr = NSAttributedString.alloc().initWithString_attributes_(self._text, attrs)
         sz   = astr.size()
-        astr.drawAtPoint_(NSMakeRect(bw / 2 - sz.width / 2, bh / 2 - sz.height / 2))
+        astr.drawAtPoint_(NSMakePoint(bw / 2 - sz.width / 2, bh / 2 - sz.height / 2))
 
 
 class EntryCardView(NSView):

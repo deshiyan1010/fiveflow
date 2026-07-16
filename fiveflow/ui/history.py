@@ -10,13 +10,15 @@ from AppKit import (
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSScrollView, NSTextField, NSButton,
 )
-from Foundation import NSObject, NSMakeRect, NSMakeSize, NSDictionary
+from Foundation import NSObject, NSMakeRect, NSMakeSize, NSMakePoint, NSDictionary
 
 from .. import state
 from ..config import NSBorderlessWindowMask, NSNonactivatingPanelMask, NSBackingStoreBuffered
 from .widgets import (
     HistoryContainerView, DividerView, BadgeView, EntryCardView, CopyButton,
 )
+
+import logging
 
 
 class HistoryWindowController(NSObject):
@@ -65,13 +67,24 @@ class HistoryWindowController(NSObject):
         title.setTextColor_(NSColor.colorWithRed_green_blue_alpha_(0.11, 0.11, 0.13, 1.0))
         container.addSubview_(title)
 
+        key_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(W - PAD - 26 - 10 - 100, H - HDR_H + (HDR_H - 26) / 2, 100, 26)
+        )
+        key_btn.setAttributedTitle_(self._button_title("Assign Key"))
+        key_btn.setBezelStyle_(12)
+        key_btn.setButtonType_(0)
+        key_btn.setTarget_(self)
+        key_btn.setAction_(b'assignKey:')
+        container.addSubview_(key_btn)
+        self._key_btn = key_btn
+        state.on_key_assigned = self._show_assigned_key
+
         dash_btn = NSButton.alloc().initWithFrame_(
             NSMakeRect(W - PAD - 26, H - HDR_H + (HDR_H - 26) / 2, 26, 26)
         )
-        dash_btn.setTitle_("\u2212")
+        dash_btn.setAttributedTitle_(self._button_title("\u2212", NSFont.boldSystemFontOfSize_(16)))
         dash_btn.setBezelStyle_(12)
         dash_btn.setButtonType_(0)
-        dash_btn.setFont_(NSFont.boldSystemFontOfSize_(16))
         dash_btn.setTarget_(self)
         dash_btn.setAction_(b'collapseHistory:')
         container.addSubview_(dash_btn)
@@ -106,24 +119,72 @@ class HistoryWindowController(NSObject):
         self._visible = False
         state.history_open[0] = False
 
+    def assignKey_(self, sender):
+        if state.listening_for_key:
+            return
+        state.listening_for_key = True
+        sender.setAttributedTitle_(self._button_title("Press a key"))
+
+    @objc.python_method
+    def _button_title(self, text, font=None):
+        attrs = {
+            NSForegroundColorAttributeName: NSColor.blackColor(),
+            NSFontAttributeName: font or NSFont.systemFontOfSize_(11),
+        }
+        return NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+
+    @objc.python_method
+    def _show_assigned_key(self, keycode):
+        self._key_btn.setAttributedTitle_(self._button_title(f"Key: {self._key_name(keycode)}"))
+
+    @objc.python_method
+    def _key_name(self, keycode):
+        names = {
+            0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X",
+            8: "C", 9: "V", 11: "B", 12: "Q", 13: "W", 14: "E", 15: "R",
+            16: "Y", 17: "T", 18: "1", 19: "2", 20: "3", 21: "4", 22: "6",
+            23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8", 29: "0",
+            30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P", 37: "L",
+            38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",", 44: "/",
+            45: "N", 46: "M", 47: ".", 50: "`",
+            36: "Return", 48: "Tab", 49: "Space", 51: "Delete", 53: "Escape",
+            55: "Command", 56: "Shift", 57: "Caps Lock", 58: "Option",
+            59: "Control", 60: "Right Shift", 61: "Right Option", 62: "Right Control",
+            63: "Fn", 76: "Enter", 123: "Left", 124: "Right", 125: "Down", 126: "Up",
+        }
+        return names.get(keycode, f"ID {keycode}")
+
     @objc.python_method
     def toggle_near_frame(self, pill_frame):
-        if self._visible:
-            self._panel.orderOut_(None)
-            self._visible = False
-            state.history_open[0] = False
-            return
-        W, H = self._W, self._H
-        px = pill_frame.origin.x + (pill_frame.size.width - W) / 2
-        py = pill_frame.origin.y + pill_frame.size.height + 8
-        sr = NSScreen.mainScreen().frame()
-        py = min(py, sr.origin.y + sr.size.height - H - 10)
-        px = max(sr.origin.x + 10, min(px, sr.origin.x + sr.size.width - W - 10))
-        self._panel.setFrameOrigin_(NSMakePoint(px, py))
-        self._update_content()
-        self._panel.orderFrontRegardless()
-        self._visible = True
-        state.history_open[0] = True
+        try:
+            import traceback
+            logging.debug(f"HistoryWindowController.toggle_near_frame: called, currently visible={self._visible}")
+            if self._visible:
+                logging.debug("Hiding history panel")
+                self._panel.orderOut_(None)
+                self._visible = False
+                state.history_open[0] = False
+                return
+            
+            W, H = self._W, self._H
+            px = pill_frame.origin.x + (pill_frame.size.width - W) / 2
+            py = pill_frame.origin.y + pill_frame.size.height + 8
+            sr = NSScreen.mainScreen().frame()
+            logging.debug(f"Screen frame: {sr}, Pill frame: {pill_frame}")
+            py = min(py, sr.origin.y + sr.size.height - H - 10)
+            px = max(sr.origin.x + 10, min(px, sr.origin.x + sr.size.width - W - 10))
+            logging.debug(f"Positioning history panel at: {px}, {py}")
+            
+            self._panel.setFrameOrigin_(NSMakePoint(px, py))
+            self._update_content()
+            self._panel.setIsVisible_(True)
+            self._panel.orderFrontRegardless()
+            self._visible = True
+            state.history_open[0] = True
+            logging.debug("History panel successfully shown")
+        except Exception as e:
+            logging.error(f"Error showing history panel: {e}")
+            logging.error(traceback.format_exc())
 
     @objc.python_method
     def _text_height(self, text, font, width):
