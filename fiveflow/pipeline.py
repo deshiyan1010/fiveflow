@@ -57,6 +57,7 @@ class Pipeline:
         self._gemma_out    = queue.Queue()
         self._trigger_events = queue.Queue()
         self._trigger_is_down = False
+        self._ignore_trigger_until_release = False
         self._command_mode = False
 
     @staticmethod
@@ -83,16 +84,11 @@ class Pipeline:
         self._trigger_events.put((pressed, shift_held))
 
     def _trigger_is_physically_down(self):
-        keycode = state.transcribe_keycode
-        # Fn is not reliably included in the combined session modifier flags.
-        # The HID key state is the source macOS exposes for its physical state.
-        if keycode == 63:
-            return bool(CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, keycode))
-        modifier_mask = self._modifier_mask_for_keycode(keycode)
-        if modifier_mask is not None:
-            flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
-            return bool(flags & modifier_mask)
-        return bool(CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, keycode))
+        # The HID state follows the physical key for Fn, modifiers, and normal
+        # keys. Combined session state can report a held assigned key as up.
+        return bool(CGEventSourceKeyState(
+            kCGEventSourceStateHIDSystemState, state.transcribe_keycode
+        ))
 
     def _watch_trigger_release(self):
         """Recover when macOS drops a key-up event while the event tap is disabled."""
@@ -262,6 +258,7 @@ class Pipeline:
                 state.transcribe_keycode = keycode
                 state.listening_for_key = False
                 self._trigger_is_down = False
+                self._ignore_trigger_until_release = True
                 print(f"New trigger key set: {keycode}")
                 if callable(state.on_key_assigned):
                     state.on_key_assigned(keycode)
@@ -272,6 +269,15 @@ class Pipeline:
             if self._recording and self._shift_held:
                 self._command_mode = True
             return event
+
+        if self._ignore_trigger_until_release:
+            if event_type == kCGEventKeyUp:
+                self._ignore_trigger_until_release = False
+            elif event_type == kCGEventFlagsChanged:
+                modifier_mask = self._modifier_mask_for_keycode(keycode)
+                if modifier_mask is not None and not (flags & modifier_mask):
+                    self._ignore_trigger_until_release = False
+            return None
 
         if event_type == kCGEventKeyDown and not self._trigger_is_down:
             self._set_trigger_pressed(True, self._shift_held)
