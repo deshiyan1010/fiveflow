@@ -29,6 +29,7 @@ from Quartz import (
     CFRunLoopAddSource, kCFRunLoopCommonModes, CFRunLoopGetMain,
     CGEventGetIntegerValueField, CGEventGetFlags, CGEventSourceFlagsState,
     CGEventSourceKeyState, kCGEventSourceStateCombinedSessionState,
+    kCGEventSourceStateHIDSystemState,
     kCGEventKeyDown, kCGEventKeyUp,
 )
 
@@ -83,6 +84,10 @@ class Pipeline:
 
     def _trigger_is_physically_down(self):
         keycode = state.transcribe_keycode
+        # Fn is not reliably included in the combined session modifier flags.
+        # The HID key state is the source macOS exposes for its physical state.
+        if keycode == 63:
+            return bool(CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, keycode))
         modifier_mask = self._modifier_mask_for_keycode(keycode)
         if modifier_mask is not None:
             flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
