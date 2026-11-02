@@ -23,7 +23,8 @@ A floating pill widget lives at the bottom of your screen. Drag it anywhere. It 
 - **Draggable pill** — Click and drag the pill to reposition it anywhere on screen.
 - **Parallel model loading** — Whisper (MPS) and Gemma (MLX) load simultaneously at startup.
 - **Fully transparent overlay** — Click-through everywhere except the pill itself; never steals focus.
-- **Stuck-recording protection** — If macOS disables the event tap and drops a release event, Fiveflow re-enables the tap and checks the physical key state to stop recording.
+- **Stuck-recording protection** — Recovers both macOS event-tap disable notifications, checks hardware key state every 50 ms for dropped releases, and limits a capture to 120 seconds. Audio-device errors reset the controller so the next recording still works.
+- **Processing recovery** — Recordings are processed one at a time. Formatting failures preserve the raw Whisper transcript; formatter requests time out after 120 seconds instead of waiting forever. Wait for the pill to return to idle before recording again.
 
 ## Command capabilities
 
@@ -108,7 +109,8 @@ stt_env/bin/python stt_pipeline.py
 
 ## Architecture
 
-Everything runs in `stt_pipeline.py` — no build step.
+`stt_pipeline.py` starts the `fiveflow` package — no build step. Recording and
+model orchestration live in `fiveflow/pipeline.py`.
 
 ```
 Main thread          NSApplication run loop, CGEventTap callbacks
@@ -116,11 +118,24 @@ _load_whisper        Loads Whisper on startup (daemon thread)
 _gemma_worker        Loads Gemma and handles all inference — MLX GPU
                      streams are thread-local so load and infer stay
                      on this one thread
-stop_recording       Stops audio stream, grabs selected text in command mode
+_recording_controller Serializes stream start/abort/close; survives device errors
+_process_audio       Grabs selection after capture stops; resets UI on errors
 transcribe_and_paste Whisper → Gemma punctuation fix → paste
 command_and_paste    Whisper → Gemma command execution → paste
-_watch_trigger_release Reconciles the actual key state if macOS drops a release event
+_watch_trigger_release Re-enables the tap, recovers releases, enforces capture limit
 ```
+
+## Recording recovery regression tests
+
+```bash
+stt_env/bin/python -m unittest discover -s tests -v
+```
+
+Tests replace macOS, microphone, and model I/O with fakes; only NumPy is needed.
+They cover dropped/coalesced release events, disabled taps, concurrent trigger
+updates, quick/empty recordings, device errors, command-mode selection failures,
+and formatter failures/timeouts. A physical Fn/microphone check on macOS is still
+needed to verify device-specific behavior.
 
 ## License
 

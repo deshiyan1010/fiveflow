@@ -5,6 +5,7 @@ import queue
 import threading
 import subprocess
 import datetime
+import logging
 
 import numpy as np
 import sounddevice as sd
@@ -27,10 +28,12 @@ from Quartz import (
     CGEventTapCreate, CGEventTapEnable, kCGSessionEventTap, kCGHeadInsertEventTap,
     kCGEventTapOptionDefault, CGEventMaskBit, kCGEventFlagsChanged,
     CFRunLoopAddSource, kCFRunLoopCommonModes, CFRunLoopGetMain,
-    CGEventGetIntegerValueField, CGEventGetFlags, CGEventSourceFlagsState,
-    CGEventSourceKeyState, kCGEventSourceStateCombinedSessionState,
+    CGEventGetIntegerValueField, CGEventGetFlags,
+    CGEventSourceKeyState,
     kCGEventSourceStateHIDSystemState,
     kCGEventKeyDown, kCGEventKeyUp,
+    kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput,
+    CGEventTapIsEnabled,
 )
 
 from . import state
@@ -40,6 +43,10 @@ from .config import (
 )
 from .ui.widgets import set_widget
 
+logger = logging.getLogger(__name__)
+MAX_RECORD_SECONDS = 120
+GEMMA_TIMEOUT_SECONDS = 120
+
 
 class Pipeline:
     def __init__(self):
@@ -47,18 +54,19 @@ class Pipeline:
         self._frames       = []
         self._stream       = None
         self._lock         = threading.Lock()
-        self._fn_pressed   = False
+        self._trigger_lock = threading.RLock()
+        self._processing   = False
         self._shift_held   = False
         self._models_ready = [False]
         self._pipe         = [None]
         self._tap_ref      = [None]
-        self._record_start = [0.0]
         self._gemma_in     = queue.Queue()
-        self._gemma_out    = queue.Queue()
         self._trigger_events = queue.Queue()
         self._trigger_is_down = False
         self._ignore_trigger_until_release = False
         self._command_mode = False
+        self._trigger_down_since = 0.0
+        self._trigger_command_mode = False
 
     @staticmethod
     def _modifier_mask_for_keycode(keycode):
@@ -73,15 +81,24 @@ class Pipeline:
 
     def _set_trigger_pressed(self, pressed, shift_held=None):
         """Queue a trigger transition once, regardless of its source."""
-        if pressed == self._trigger_is_down:
-            return
-        self._trigger_is_down = pressed
-        if shift_held is None:
-            shift_held = bool(
-                CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState)
-                & kCGEventFlagMaskShift
-            )
-        self._trigger_events.put((pressed, shift_held))
+        with self._trigger_lock:
+            if not pressed:
+                self._ignore_trigger_until_release = False
+            if pressed == self._trigger_is_down or self._ignore_trigger_until_release:
+                return
+            self._trigger_is_down = pressed
+            if pressed:
+                self._trigger_down_since = time.monotonic()
+            if shift_held is None:
+                shift_held = self._shift_held
+            if pressed:
+                self._trigger_command_mode = shift_held
+            else:
+                shift_held = shift_held or self._trigger_command_mode
+                self._trigger_command_mode = False
+            # Keep the state change and queue insertion atomic with respect to
+            # the tap and watchdog; a stale poll must not stop the next press.
+            self._trigger_events.put((pressed, shift_held))
 
     def _trigger_is_physically_down(self):
         # The HID state follows the physical key for Fn, modifiers, and normal
@@ -90,16 +107,47 @@ class Pipeline:
             kCGEventSourceStateHIDSystemState, state.transcribe_keycode
         ))
 
-    def _watch_trigger_release(self):
-        """Recover when macOS drops a key-up event while the event tap is disabled."""
-        while True:
-            if (
-                self._trigger_is_down
-                and not state.listening_for_key
-                and not self._trigger_is_physically_down()
-            ):
+    def _poll_trigger_release(self):
+        """Reconcile hardware state even if the tap never delivers key-up."""
+        if self._tap_ref[0] and not CGEventTapIsEnabled(self._tap_ref[0]):
+            CGEventTapEnable(self._tap_ref[0], True)
+        with self._trigger_lock:
+            if state.listening_for_key:
+                return
+            if not (self._trigger_is_down or self._ignore_trigger_until_release):
+                return
+            elapsed = time.monotonic() - self._trigger_down_since
+            # HID state can lag the press callback briefly. Explicit release
+            # events still stop immediately, including very short taps.
+            if elapsed >= 0.15 and not self._trigger_is_physically_down():
                 self._set_trigger_pressed(False)
+            elif self._trigger_is_down and elapsed >= MAX_RECORD_SECONDS:
+                logger.warning("Recording limit reached; recovering missing trigger release")
+                self._set_trigger_pressed(False)
+                self._ignore_trigger_until_release = True
+
+    def _watch_trigger_release(self):
+        while True:
+            try:
+                self._poll_trigger_release()
+            except Exception:
+                logger.exception("Trigger watchdog failed; retrying")
             time.sleep(0.05)
+
+    def _generate_text(self, task):
+        # Replies belong to a request. A timed-out result must never be pasted
+        # as the response to a later recording.
+        response = queue.Queue(maxsize=1)
+        self._gemma_in.put((task, response))
+        try:
+            result = response.get(timeout=GEMMA_TIMEOUT_SECONDS)
+        except queue.Empty as exc:
+            raise TimeoutError(
+                f"Gemma did not respond within {GEMMA_TIMEOUT_SECONDS} seconds"
+            ) from exc
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     def paste_at_cursor(self, text):
         original = subprocess.run(["pbpaste"], capture_output=True).stdout
@@ -133,8 +181,11 @@ class Pipeline:
         print(f"Transcript: {transcript}")
 
         set_widget('active', 'Formatting...')
-        self._gemma_in.put(('transcribe', transcript))
-        formatted = self._gemma_out.get()
+        try:
+            formatted = self._generate_text(('transcribe', transcript))
+        except Exception:
+            logger.exception("Formatting failed; preserving the Whisper transcript")
+            formatted = transcript
         print(f"Formatted:  {formatted}")
 
         state.transcription_history.append({
@@ -142,8 +193,6 @@ class Pipeline:
         })
         self.paste_at_cursor(formatted)
         set_widget('active', 'Done')
-        time.sleep(1.5)
-        set_widget('idle')
 
     def command_and_paste(self, audio, selected):
         set_widget('active', 'Transcribing...')
@@ -153,8 +202,7 @@ class Pipeline:
         print(f"Selected: {selected!r}")
 
         set_widget('active', 'Thinking...')
-        self._gemma_in.put(('command', command, selected))
-        output = self._gemma_out.get()
+        output = self._generate_text(('command', command, selected))
         print(f"Output:   {output}")
 
         state.transcription_history.append({
@@ -162,14 +210,13 @@ class Pipeline:
         })
         self.paste_at_cursor(output)
         set_widget('active', 'Done')
-        time.sleep(1.5)
-        set_widget('idle')
 
     def _open_audio_stream(self):
         self._frames = []
+        frames = self._frames
 
         def audio_callback(indata, _frame_count, _time_info, _status):
-            self._frames.append(indata.copy())
+            frames.append(indata.copy())
             rms = float(np.sqrt(np.mean(indata ** 2)))
             state.audio_level = min(1.0, rms * 15)
 
@@ -187,78 +234,105 @@ class Pipeline:
             os.close(saved_fd2)
             os.close(devnull_fd)
         self._recording = True
-        self._record_start[0] = time.monotonic()
         set_widget('recording')
 
     def _close_audio_stream(self):
         stream, self._stream = self._stream, None
         try:
             if stream is not None:
-                stream.stop()
-                stream.close()
+                try:
+                    # Input has no output buffers to drain; stop capture now.
+                    stream.abort(ignore_errors=False)
+                finally:
+                    stream.close()
         finally:
             state.audio_level = 0.0
             self._recording = False
 
     def _process_audio(self, audio, mode):
-        if len(audio) >= SAMPLE_RATE:
-            if mode == 'command':
-                threading.Thread(target=self.command_and_paste, args=(audio, self.get_selected_text()), daemon=True).start()
+        try:
+            if len(audio) < SAMPLE_RATE:
+                set_widget('active', 'Too short')
+            elif mode == 'command':
+                self.command_and_paste(audio, self.get_selected_text())
             else:
-                threading.Thread(target=self.transcribe_and_paste, args=(audio,), daemon=True).start()
-        else:
-            set_widget('active', 'Too short')
-            time.sleep(2)
+                self.transcribe_and_paste(audio)
+        except Exception:
+            logger.exception("Audio processing failed")
+            set_widget('active', 'Processing failed')
+        finally:
+            time.sleep(1.5)
             set_widget('idle')
+            with self._lock:
+                self._processing = False
+
+    def _handle_trigger_transition(self, pressed, shift_held):
+        if not self._models_ready[0]:
+            return
+        with self._lock:
+            if pressed and not self._recording and not self._processing:
+                self._command_mode = shift_held
+                self._open_audio_stream()
+                print("Recording started.")
+            elif not pressed and self._recording:
+                mode = 'command' if self._command_mode or shift_held else 'transcribe'
+                self._close_audio_stream()
+                print(f"Recording stopped. mode={mode}")
+                audio = (
+                    np.concatenate(self._frames, axis=0).reshape(-1)
+                    if self._frames
+                    else np.empty(0, dtype=np.float32)
+                )
+                self._frames = []
+                self._command_mode = False
+                self._processing = True
+                set_widget('active', 'Transcribing...' if audio.size >= SAMPLE_RATE else 'Too short')
+                threading.Thread(target=self._process_audio, args=(audio, mode), daemon=True).start()
 
     def _recording_controller(self):
         while True:
             pressed, shift_held = self._trigger_events.get()
-            if not self._models_ready[0]:
-                continue
-
-            action = None
-            with self._lock:
-                if pressed and not self._recording:
-                    self._open_audio_stream()
-                    self._command_mode = shift_held
-                    print("Recording started.")
-                elif not pressed and self._recording:
-                    mode = 'command' if self._command_mode or shift_held else 'transcribe'
+            try:
+                self._handle_trigger_transition(pressed, shift_held)
+            except Exception:
+                # One PortAudio/selection failure must not kill the only thread
+                # that can stop future recordings.
+                logger.exception("Recording transition failed")
+                try:
                     self._close_audio_stream()
-                    print(f"Recording stopped. mode={mode}")
-                    # A quick release can happen before SoundDevice invokes its
-                    # first callback. Treat that as an empty, too-short capture.
-                    audio = (
-                        np.concatenate(self._frames, axis=0).squeeze()
-                        if self._frames
-                        else np.empty(0, dtype=np.float32)
-                    )
+                except Exception:
+                    logger.exception("Audio stream cleanup failed")
+                with self._lock:
                     self._command_mode = False
-                    action = ('process', audio, mode)
-
-            if action:
-                self._process_audio(action[1], action[2])
+                    self._processing = False
+                    self._frames = []
+                set_widget('idle')
+            finally:
+                self._trigger_events.task_done()
 
     def fn_event_callback(self, proxy, event_type, event, refcon):
-        if event_type in (0xFFFFFFFE, 0xFFFFFFFD):
+        if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
             if self._tap_ref[0]:
                 CGEventTapEnable(self._tap_ref[0], True)
             # A key-up event may have occurred while the tap was disabled.
-            if self._trigger_is_down and not self._trigger_is_physically_down():
-                self._set_trigger_pressed(False)
+            self._poll_trigger_release()
             return event
 
         keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
         flags = CGEventGetFlags(event)
         self._shift_held = bool(flags & kCGEventFlagMaskShift)
+        with self._trigger_lock:
+            if self._trigger_is_down and self._shift_held:
+                self._trigger_command_mode = True
 
         if state.listening_for_key:
             if event_type in (kCGEventKeyDown, kCGEventFlagsChanged):
                 state.transcribe_keycode = keycode
                 state.listening_for_key = False
-                self._trigger_is_down = False
-                self._ignore_trigger_until_release = True
+                with self._trigger_lock:
+                    self._set_trigger_pressed(False)
+                    self._ignore_trigger_until_release = True
+                    self._trigger_down_since = time.monotonic()
                 print(f"New trigger key set: {keycode}")
                 if callable(state.on_key_assigned):
                     state.on_key_assigned(keycode)
@@ -266,8 +340,12 @@ class Pipeline:
             return event
 
         if keycode != state.transcribe_keycode:
-            if self._recording and self._shift_held:
-                self._command_mode = True
+            # Fn-up may be coalesced into another modifier's flags event.
+            # Its flag disappearing is release evidence even with another keycode.
+            modifier_mask = self._modifier_mask_for_keycode(state.transcribe_keycode)
+            if (event_type == kCGEventFlagsChanged and modifier_mask is not None
+                    and not (flags & modifier_mask)):
+                self._set_trigger_pressed(False, self._shift_held)
             return event
 
         if self._ignore_trigger_until_release:
@@ -309,6 +387,79 @@ class Pipeline:
             kCFRunLoopCommonModes,
         )
 
+    def _gemma_reply(self, g_model, g_proc, task):
+        if task[0] == 'transcribe':
+            sys_prompt = (
+                "You are a transcription editor for spoken English. "
+                "Your only job is to fix punctuation and sentence flow. "
+                "You must not change, add, or remove any words.\n\n"
+                "Rules:\n"
+                "- When two phrases are part of the same continuous thought, join them with a comma, "
+                "em-dash, semicolon, or conjunction - never a full stop\n"
+                "- Only place a full stop when the thought is genuinely complete and the next clause "
+                "is an independent, separate idea\n"
+                "- Do not rephrase, restructure, or paraphrase anything\n"
+                "- Do not add any words, filler, or commentary that was not in the original\n"
+                "- Return only the corrected transcription, nothing else"
+            )
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user",   "content": task[1]},
+            ]
+            max_tok, temp = 384, 0.15
+        else:
+            command, selected = task[1], task[2]
+            sys_prompt = (
+                "You are a precise voice command executor. "
+                "Execute the user's command exactly and return only the result - "
+                "no preamble, label, explanation, or commentary of any kind.\n\n"
+                "You can handle any text task, including but not limited to:\n"
+                "- Rewrite / rephrase / paraphrase\n"
+                "- Make formal, casual, concise, assertive, empathetic, or humorous\n"
+                "- Fix grammar, spelling, punctuation, or clarity\n"
+                "- Summarise, expand, shorten, or elaborate\n"
+                "- Convert format: bullet points, numbered list, table, paragraph, markdown, plain text\n"
+                "- Translate to any language\n"
+                "- Explain, simplify, or add detail\n"
+                "- Refactor, explain, comment, or convert code\n"
+                "- Extract key points, action items, names, dates, or any other structured data\n"
+                "- Continue, complete, or extend a piece of text\n"
+                "- Answer a question or generate fresh content when no text is selected\n\n"
+                "If the command is ambiguous, make the most reasonable interpretation without asking. "
+                "Preserve formatting of the original text unless the command explicitly changes it."
+            )
+            if selected:
+                user_content = (
+                    f"Selected text:\n{selected}\n\n"
+                    f"Voice command: {command}"
+                )
+            else:
+                user_content = f"Voice command: {command}"
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user",   "content": user_content},
+            ]
+            max_tok, temp = 1024, 0.4
+        prompt = g_proc.apply_chat_template(messages, add_generation_prompt=True)
+        reply = vlm_generate(g_model, g_proc, prompt=prompt,
+                             max_tokens=max_tok, temperature=temp, verbose=False)
+        return reply.text.strip()
+
+    def _gemma_worker(self, ready):
+        print(f"Loading {GEMMA_MODEL_ID}...")
+        g_model, g_proc = vlm_load(GEMMA_MODEL_ID)
+        print("Gemma ready.")
+        ready.set()
+        while True:
+            task, response = self._gemma_in.get()
+            try:
+                response.put(self._gemma_reply(g_model, g_proc, task))
+            except Exception as exc:
+                logger.exception("Gemma request failed")
+                response.put(exc)
+            finally:
+                self._gemma_in.task_done()
+
     def load_models(self):
         set_widget('active', 'Loading models...')
         whisper_done = threading.Event()
@@ -333,72 +484,8 @@ class Pipeline:
             print("Whisper ready.")
             whisper_done.set()
 
-        def _gemma_worker():
-            print(f"Loading {GEMMA_MODEL_ID}...")
-            g_model, g_proc = vlm_load(GEMMA_MODEL_ID)
-            print("Gemma ready.")
-            gemma_done.set()
-            while True:
-                task = self._gemma_in.get()
-                if task[0] == 'transcribe':
-                    sys_prompt = (
-                        "You are a transcription editor for spoken English. "
-                        "Your only job is to fix punctuation and sentence flow. "
-                        "You must not change, add, or remove any words.\n\n"
-                        "Rules:\n"
-                        "- When two phrases are part of the same continuous thought, join them with a comma, "
-                        "em-dash, semicolon, or conjunction - never a full stop\n"
-                        "- Only place a full stop when the thought is genuinely complete and the next clause "
-                        "is an independent, separate idea\n"
-                        "- Do not rephrase, restructure, or paraphrase anything\n"
-                        "- Do not add any words, filler, or commentary that was not in the original\n"
-                        "- Return only the corrected transcription, nothing else"
-                    )
-                    messages = [
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user",   "content": task[1]},
-                    ]
-                    max_tok, temp = 384, 0.15
-                else:
-                    command, selected = task[1], task[2]
-                    sys_prompt = (
-                        "You are a precise voice command executor. "
-                        "Execute the user's command exactly and return only the result - "
-                        "no preamble, label, explanation, or commentary of any kind.\n\n"
-                        "You can handle any text task, including but not limited to:\n"
-                        "- Rewrite / rephrase / paraphrase\n"
-                        "- Make formal, casual, concise, assertive, empathetic, or humorous\n"
-                        "- Fix grammar, spelling, punctuation, or clarity\n"
-                        "- Summarise, expand, shorten, or elaborate\n"
-                        "- Convert format: bullet points, numbered list, table, paragraph, markdown, plain text\n"
-                        "- Translate to any language\n"
-                        "- Explain, simplify, or add detail\n"
-                        "- Refactor, explain, comment, or convert code\n"
-                        "- Extract key points, action items, names, dates, or any other structured data\n"
-                        "- Continue, complete, or extend a piece of text\n"
-                        "- Answer a question or generate fresh content when no text is selected\n\n"
-                        "If the command is ambiguous, make the most reasonable interpretation without asking. "
-                        "Preserve formatting of the original text unless the command explicitly changes it."
-                    )
-                    if selected:
-                        user_content = (
-                            f"Selected text:\n{selected}\n\n"
-                            f"Voice command: {command}"
-                        )
-                    else:
-                        user_content = f"Voice command: {command}"
-                    messages = [
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user",   "content": user_content},
-                    ]
-                    max_tok, temp = 1024, 0.4
-                prompt = g_proc.apply_chat_template(messages, add_generation_prompt=True)
-                reply = vlm_generate(g_model, g_proc, prompt=prompt,
-                                     max_tokens=max_tok, temperature=temp, verbose=False)
-                self._gemma_out.put(reply.text.strip())
-
         threading.Thread(target=_load_whisper, daemon=True).start()
-        threading.Thread(target=_gemma_worker, daemon=True).start()
+        threading.Thread(target=self._gemma_worker, args=(gemma_done,), daemon=True).start()
 
         while not (whisper_done.is_set() and gemma_done.is_set()):
             time.sleep(0.3)
@@ -408,7 +495,6 @@ class Pipeline:
                 set_widget('active', 'Loading Whisper...')
 
         self._models_ready[0] = True
-        self._fn_pressed = False
         set_widget('idle')
         print("Models ready. Hold Fn to record, release to transcribe.\n")
         subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
