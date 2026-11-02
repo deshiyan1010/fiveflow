@@ -3,6 +3,8 @@ import sys
 import subprocess
 import tty
 import termios
+import getpass
+import select
 
 from Foundation import NSDictionary
 from ApplicationServices import AXIsProcessTrustedWithOptions
@@ -19,10 +21,14 @@ def request_accessibility():
 
 def prompt_hf_token_if_needed():
     from pathlib import Path
-    cache = Path.home() / ".cache" / "huggingface" / "hub"
+    if os.environ.get('HF_TOKEN') or not sys.stdin.isatty():
+        return
+    cache = Path(os.environ.get('HF_HUB_CACHE',
+                 str(Path(os.environ.get('HF_HOME', str(Path.home() / '.cache/huggingface'))) / 'hub')))
 
     def is_cached(model_id):
-        return (cache / ("models--" + model_id.replace("/", "--"))).exists()
+        directory = cache / ("models--" + model_id.replace("/", "--")) / 'snapshots'
+        return any(directory.glob('*/config.json'))
 
     whisper_ok = is_cached(WHISPER_MODEL_ID)
     gemma_ok   = is_cached(GEMMA_MODEL_ID)
@@ -43,7 +49,10 @@ def prompt_hf_token_if_needed():
     print("A Hugging Face token (huggingface.co/settings/tokens) speeds up the download.")
     print("If you skip this, the download will be very slow (no rate-limit bypass).")
     print()
-    token = input("HF token [press Enter to skip]: ").strip()
+    try:
+        token = getpass.getpass("HF token [press Enter to skip]: ").strip()
+    except EOFError:
+        return
     if token:
         os.environ["HF_TOKEN"] = token
         print()
@@ -53,7 +62,7 @@ def prompt_hf_token_if_needed():
 
 def ask_yes_no_arrow(prompt):
     print(prompt)
-    choice = True
+    choice = False
 
     def draw():
         sys.stdout.write("\r\033[K")
@@ -63,21 +72,25 @@ def ask_yes_no_arrow(prompt):
             sys.stdout.write("    Yes  \033[1m\033[36m> No\033[0m  ")
         sys.stdout.flush()
 
-    fd = sys.stdin.fileno()
+    if not sys.stdin.isatty():
+        return False
     try:
+        fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
-    except termios.error:
-        try:
-            res = input(" (Yes/No) [y/N]: ").strip().lower()
-            return res in ('y', 'yes')
-        except (KeyboardInterrupt, EOFError):
-            return False
+    except (OSError, ValueError, AttributeError):
+        return False
 
     try:
         tty.setraw(fd)
         draw()
         while True:
-            ch1 = sys.stdin.read(1)
+            ch1 = os.read(fd, 1).decode('ascii', errors='ignore')
+            if ch1 == '\x03':
+                choice = False
+                break
+            if not ch1:
+                choice = False
+                break
             if ch1 in ('\r', '\n'):
                 break
             elif ch1.lower() == 'y':
@@ -87,9 +100,15 @@ def ask_yes_no_arrow(prompt):
                 choice = False
                 draw()
             elif ch1 == '\033':
-                ch2 = sys.stdin.read(1)
+                if not select.select([sys.stdin], [], [], 0.1)[0]:
+                    choice = False
+                    break
+                ch2 = os.read(fd, 1).decode('ascii', errors='ignore')
                 if ch2 == '[':
-                    ch3 = sys.stdin.read(1)
+                    if not select.select([sys.stdin], [], [], 0.1)[0]:
+                        choice = False
+                        break
+                    ch3 = os.read(fd, 1).decode('ascii', errors='ignore')
                     if ch3 in ('A', 'D'):
                         choice = True
                     elif ch3 in ('B', 'C'):
@@ -104,38 +123,16 @@ def ask_yes_no_arrow(prompt):
 
 
 def check_for_updates():
-    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if not os.path.exists(os.path.join(script_dir, ".git")):
+    from pathlib import Path
+    from .updates import available_update, apply_update
+    root = Path(__file__).resolve().parents[1]
+    # Background/GUI launches must not block on terminal prompts.
+    if not sys.stdin.isatty():
         return
-
-    print("[fiveflow] Checking for updates...")
     try:
-        subprocess.run(["git", "-C", script_dir, "fetch", "origin", "--quiet"],
-                       timeout=5.0, capture_output=True, check=True)
-
-        local_hash = subprocess.run(["git", "-C", script_dir, "rev-parse", "HEAD"],
-                                    capture_output=True, text=True, check=True).stdout.strip()
-        remote_hash = subprocess.run(["git", "-C", script_dir, "rev-parse", "origin/master"],
-                                     capture_output=True, text=True, check=True).stdout.strip()
-
-        if local_hash != remote_hash:
-            behind = subprocess.run(["git", "-C", script_dir, "log", f"{local_hash}..{remote_hash}", "--oneline"],
-                                    capture_output=True, text=True, check=True).stdout.strip()
-            if behind:
-                prompt = "\n[fiveflow] A new update is available! Would you like to upgrade now?"
-                if ask_yes_no_arrow(prompt):
-                    print("[fiveflow] Upgrading to the latest version...")
-                    subprocess.run(["git", "-C", script_dir, "reset", "--hard", "origin/master"], check=True)
-
-                    pip_path = os.path.join(os.path.dirname(sys.executable), "pip")
-                    req_path = os.path.join(script_dir, "requirements.txt")
-                    if os.path.exists(pip_path) and os.path.exists(req_path):
-                        print("[fiveflow] Updating dependencies...")
-                        subprocess.run([pip_path, "install", "-q", "-r", req_path], check=True)
-
-                    print("[fiveflow] Upgrade complete! Restarting...")
-                    os.execv(sys.executable, [sys.executable] + sys.argv)
-                else:
-                    print("[fiveflow] Update skipped.")
-    except Exception as e:
-        print(f"[fiveflow] Could not check for updates: {e}")
+        target = available_update(root)
+        if target and ask_yes_no_arrow("[fiveflow] An update is available. Upgrade now?"):
+            apply_update(root, target)
+            os.execv(sys.executable, [sys.executable, str(root / 'stt_pipeline.py'), *sys.argv[1:]])
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"[fiveflow] Could not update: {exc}")

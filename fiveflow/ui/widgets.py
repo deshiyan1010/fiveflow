@@ -1,5 +1,4 @@
 import math
-import subprocess
 import queue
 
 import objc
@@ -11,11 +10,12 @@ from AppKit import (
 )
 from Foundation import NSObject, NSTimer, NSMakeRect, NSMakePoint, NSDictionary
 
-from .. import state
+from .. import state, clipboard
+from .geometry import pill_contains
 from ..config import WIN_W, WIN_H
 
 import logging
-logging.basicConfig(filename='/tmp/fiveflow_debug.log', level=logging.DEBUG, format='%(asctime)s %(levelname)s:%(message)s')
+logger = logging.getLogger(__name__)
 
 
 class PillView(NSView):
@@ -61,6 +61,9 @@ class PillView(NSView):
         self.setNeedsDisplay_(True)
 
     def hitTest_(self, point):
+        if self._state == 'error':
+            bw, bh = self.bounds().size.width, self.bounds().size.height
+            return self if (bw - 200) / 2 <= point.x <= (bw + 200) / 2 and (bh - 38) / 2 <= point.y <= (bh + 38) / 2 else None
         if self._state != 'idle':
             return None
         bw = self.bounds().size.width
@@ -81,6 +84,7 @@ class PillView(NSView):
         return None
 
     def mouseDown_(self, event):
+        self._mouse_down = True
         self._did_drag = False
 
     def mouseDragged_(self, event):
@@ -94,8 +98,18 @@ class PillView(NSView):
         ))
 
     def mouseUp_(self, event):
+        self._mouse_down = False
+        if self._state == 'error':
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().terminate_(None)
+            return
         logging.debug(f"PillView mouseUp_: state={self._state}, did_drag={self._did_drag}")
         if self._state != 'idle':
+            return
+        if self._did_drag:
+            self._did_drag = False
+            if state.history_open[0] and state.toggle_history_callback[0]:
+                state.toggle_history_callback[0]()
             return
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
         bw  = self.bounds().size.width
@@ -114,14 +128,8 @@ class PillView(NSView):
         
         logging.debug(f"PillView mouseUp_: checking toggle callback. callback exists: {state.toggle_history_callback[0] is not None}")
         
-        if self._did_drag:
-            if state.history_open[0] and state.toggle_history_callback[0]:
-                logging.debug("PillView mouseUp_: invoking toggle callback after drag")
-                state.toggle_history_callback[0]()
-        else:
-            if state.toggle_history_callback[0]:
-                logging.debug("PillView mouseUp_: invoking toggle callback")
-                state.toggle_history_callback[0]()
+        if state.toggle_history_callback[0]:
+            state.toggle_history_callback[0]()
         self._did_drag = False
 
     def drawRect_(self, rect):
@@ -197,7 +205,8 @@ class PillView(NSView):
             pw, ph = 200, 38
             px, py = (bw - pw) / 2, (bh - ph) / 2
             self._pill(px, py, pw, ph, dark)
-            self._text(self._label, px + pw / 2, py + ph / 2, 13, bold=True)
+            label = self._label + ' · Quit' if self._state == 'error' else self._label
+            self._text(label, px + pw / 2, py + ph / 2, 13, bold=True)
 
     @objc.python_method
     def _pill(self, x, y, w, h, color):
@@ -223,10 +232,30 @@ class PillView(NSView):
         changed = False
         try:
             while True:
+                callback, argument = state.ui_callbacks.get_nowait()
+                try:
+                    callback(argument)
+                except Exception:
+                    logger.exception("UI callback failed")
+        except queue.Empty:
+            pass
+        try:
+            while True:
                 self._state, self._label = state.state_queue.get_nowait()
                 changed = True
         except queue.Empty:
             pass
+
+        window = self.window()
+        if window is not None:
+            point = self.convertPoint_fromView_(window.mouseLocationOutsideOfEventStream(), None)
+            inside = (self._state == 'idle' and pill_contains(
+                self.bounds().size.width, self._hover_scale, self._hovering, point.x, point.y))
+            if self._hovering != inside:
+                self._hovering = inside
+                changed = True
+            interactive = self.hitTest_(point) is not None
+            window.setIgnoresMouseEvents_(not (interactive or getattr(self, '_mouse_down', False)))
 
         if self._state == 'recording':
             self._pill_scale = min(1.0, self._pill_scale + 0.12)
@@ -259,7 +288,11 @@ class CopyButton(NSButton):
     _copy_text = ''
 
     def performCopy_(self, sender):
-        subprocess.run(["pbcopy"], input=self._copy_text.encode())
+        try:
+            clipboard.copy_text(self._copy_text)
+        except Exception:
+            logger.exception("Could not copy history entry")
+            return
         self.setTitle_("\u2713")
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.5, self, b'resetCopyTitle:', None, False
