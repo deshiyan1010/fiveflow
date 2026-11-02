@@ -19,8 +19,13 @@ import logging
 
 class AppDelegate(NSObject):
     def applicationWillTerminate_(self, notification):
-        subprocess.run(["afplay", "/System/Library/Sounds/Bottle.aiff"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if getattr(self, '_pipeline', None) is not None:
+            self._pipeline.shutdown()
+        try:
+            subprocess.run(["afplay", "/System/Library/Sounds/Bottle.aiff"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            logging.debug("Exit sound unavailable")
 
     def applicationDidFinishLaunching_(self, notification):
         sf = NSScreen.mainScreen().frame()
@@ -42,6 +47,7 @@ class AppDelegate(NSObject):
             | NSWindowCollectionBehaviorFullScreenAuxiliary
         )
         panel.setHasShadow_(False)
+        panel.setIgnoresMouseEvents_(True)
 
         view = PillView.alloc().initWithFrame_(NSMakeRect(0, 0, WIN_W, WIN_H))
         panel.setContentView_(view)

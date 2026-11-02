@@ -14,6 +14,7 @@ from Foundation import NSObject, NSMakeRect, NSMakeSize, NSMakePoint, NSDictiona
 
 from .. import state
 from ..config import NSBorderlessWindowMask, NSNonactivatingPanelMask, NSBackingStoreBuffered
+from .geometry import history_position
 from .widgets import (
     HistoryContainerView, DividerView, BadgeView, EntryCardView, CopyButton,
 )
@@ -78,6 +79,7 @@ class HistoryWindowController(NSObject):
         container.addSubview_(key_btn)
         self._key_btn = key_btn
         state.on_key_assigned = self._show_assigned_key
+        state.on_history_changed = self._refresh_if_visible
 
         dash_btn = NSButton.alloc().initWithFrame_(
             NSMakeRect(W - PAD - 26, H - HDR_H + (HDR_H - 26) / 2, 26, 26)
@@ -115,15 +117,28 @@ class HistoryWindowController(NSObject):
         self._content_W    = content_w
 
     def collapseHistory_(self, sender):
+        self._cancel_key_assignment()
         self._panel.orderOut_(None)
         self._visible = False
         state.history_open[0] = False
 
+    @objc.python_method
+    def _refresh_if_visible(self, unused):
+        if self._visible:
+            self._update_content()
+
+    @objc.python_method
+    def _cancel_key_assignment(self):
+        if state.listening_for_key:
+            state.listening_for_key = False
+            self._show_assigned_key(state.transcribe_keycode)
+
     def assignKey_(self, sender):
         if state.listening_for_key:
+            self._cancel_key_assignment()
             return
         state.listening_for_key = True
-        sender.setAttributedTitle_(self._button_title("Press a key"))
+        sender.setAttributedTitle_(self._button_title("Key / Esc"))
 
     @objc.python_method
     def _button_title(self, text, font=None):
@@ -148,7 +163,7 @@ class HistoryWindowController(NSObject):
             38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",", 44: "/",
             45: "N", 46: "M", 47: ".", 50: "`",
             36: "Return", 48: "Tab", 49: "Space", 51: "Delete", 53: "Escape",
-            55: "Command", 56: "Shift", 57: "Caps Lock", 58: "Option",
+            54: "Right Command", 55: "Command", 56: "Shift", 57: "Caps Lock", 58: "Option",
             59: "Control", 60: "Right Shift", 61: "Right Option", 62: "Right Control",
             63: "Fn", 76: "Enter", 123: "Left", 124: "Right", 125: "Down", 126: "Up",
         }
@@ -160,6 +175,7 @@ class HistoryWindowController(NSObject):
             import traceback
             logging.debug(f"HistoryWindowController.toggle_near_frame: called, currently visible={self._visible}")
             if self._visible:
+                self._cancel_key_assignment()
                 logging.debug("Hiding history panel")
                 self._panel.orderOut_(None)
                 self._visible = False
@@ -167,14 +183,14 @@ class HistoryWindowController(NSObject):
                 return
             
             W, H = self._W, self._H
-            px = pill_frame.origin.x + (pill_frame.size.width - W) / 2
-            py = pill_frame.origin.y + pill_frame.size.height + 8
-            sr = NSScreen.mainScreen().frame()
-            logging.debug(f"Screen frame: {sr}, Pill frame: {pill_frame}")
-            py = min(py, sr.origin.y + sr.size.height - H - 10)
-            px = max(sr.origin.x + 10, min(px, sr.origin.x + sr.size.width - W - 10))
-            logging.debug(f"Positioning history panel at: {px}, {py}")
-            
+            frames = [screen.visibleFrame() for screen in NSScreen.screens()]
+            if not frames:
+                return
+            px, py = history_position(
+                (pill_frame.origin.x, pill_frame.origin.y, pill_frame.size.width, pill_frame.size.height),
+                [(f.origin.x, f.origin.y, f.size.width, f.size.height) for f in frames],
+                (W, H),
+            )
             self._panel.setFrameOrigin_(NSMakePoint(px, py))
             self._update_content()
             self._panel.setIsVisible_(True)

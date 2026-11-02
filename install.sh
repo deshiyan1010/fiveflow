@@ -28,6 +28,12 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 1
 fi
 
+# MLX runs on Apple silicon with macOS 14 or newer.
+if [[ "$(uname -m)" != "arm64" ]] || [[ "$(sw_vers -productVersion | cut -d. -f1)" -lt 14 ]]; then
+    warn "Fiveflow requires Apple silicon and macOS 14 or newer. Use a native arm64 terminal."
+    exit 1
+fi
+
 # ── Check Python 3.13 ─────────────────────────────────────────────────────────
 if ! command -v python3.13 &>/dev/null; then
     echo ""
@@ -38,11 +44,20 @@ if ! command -v python3.13 &>/dev/null; then
     exit 1
 fi
 
+if [[ "$(python3.13 -c 'import platform; print(platform.machine())')" != "arm64" ]]; then
+    warn "Python 3.13 must run natively on arm64, not under Rosetta."
+    exit 1
+fi
+
 # ── Clone or sync to latest ───────────────────────────────────────────────────
 if [ -d "$INSTALL_DIR/.git" ]; then
     info "Syncing to latest version..."
     git -C "$INSTALL_DIR" fetch origin --quiet
-    git -C "$INSTALL_DIR" reset --hard origin/master --quiet
+    if [ -n "$(git -C "$INSTALL_DIR" status --porcelain --untracked-files=normal)" ]; then
+        warn "Local changes in $INSTALL_DIR. Commit or stash them before reinstalling."
+        exit 1
+    fi
+    git -C "$INSTALL_DIR" merge --ff-only origin/master --quiet
 else
     info "Cloning fiveflow into $INSTALL_DIR ..."
     git clone --quiet "$REPO_URL" "$INSTALL_DIR"
@@ -78,57 +93,12 @@ elif [ ! -f "$SHELL_RC" ] && [ ! -w "$(dirname "$SHELL_RC")" ]; then
     IS_WRITABLE=false
 fi
 
-# ── Remove any existing fiveflow block (sentinel-based) ──────────────────────
-if grep -q "# >>> fiveflow >>>" "$SHELL_RC" 2>/dev/null; then
-    if [ "$IS_WRITABLE" = true ]; then
-        sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
-    else
-        warn "$SHELL_RC is not writable. Requesting sudo to update configuration..."
-        sudo sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
-    fi
-    info "Replacing existing fiveflow functions in $SHELL_RC"
-fi
-
-# ── Write shell functions with sentinels ─────────────────────────────────────
-BLOCK_CONTENT=$(cat << SHELL_BLOCK
-
-# >>> fiveflow >>>
-fiveflow() {
-    "$INSTALL_DIR/stt_env/bin/python" "$INSTALL_DIR/stt_pipeline.py"
-}
-fiveflow-update() {
-    echo "[fiveflow] Fetching latest version..."
-    git -C "$INSTALL_DIR" fetch origin --quiet
-    git -C "$INSTALL_DIR" reset --hard origin/master --quiet
-    echo "[fiveflow] Updating dependencies..."
-    "$INSTALL_DIR/stt_env/bin/pip" install -q --upgrade pip
-    "$INSTALL_DIR/stt_env/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
-    echo "[fiveflow] Done. Run: fiveflow"
-}
-fiveflow-remove() {
-    echo "[fiveflow] Uninstalling..."
-    # App files
-    rm -rf "$INSTALL_DIR"
-    # Hugging Face model caches
-    rm -rf "$WHISPER_CACHE"
-    rm -rf "$GEMMA_CACHE"
-    # Shell functions
-    if [ -w "$SHELL_RC" ]; then
-        sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
-    else
-        sudo sed -i '' '/# >>> fiveflow >>>/,/# <<< fiveflow <<</d' "$SHELL_RC"
-    fi
-    echo "[fiveflow] Fully removed. Run: source $SHELL_RC"
-}
-# <<< fiveflow <<<
-SHELL_BLOCK
-)
-
+# ── Register safely quoted shell functions without replacing user dotfiles ──
 if [ "$IS_WRITABLE" = true ]; then
-    echo "$BLOCK_CONTENT" >> "$SHELL_RC"
+    "$INSTALL_DIR/stt_env/bin/python" "$INSTALL_DIR/fiveflow/shell_config.py" --install "$SHELL_RC" "$INSTALL_DIR" "$WHISPER_CACHE" "$GEMMA_CACHE"
 else
     warn "$SHELL_RC is not writable. Writing configuration with sudo..."
-    echo "$BLOCK_CONTENT" | sudo tee -a "$SHELL_RC" >/dev/null
+    sudo "$INSTALL_DIR/stt_env/bin/python" "$INSTALL_DIR/fiveflow/shell_config.py" --install "$SHELL_RC" "$INSTALL_DIR" "$WHISPER_CACHE" "$GEMMA_CACHE"
 fi
 
 info "Added fiveflow / fiveflow-update / fiveflow-remove to $SHELL_RC"

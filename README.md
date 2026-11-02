@@ -2,7 +2,7 @@
 
 A real-time speech-to-text overlay for macOS. Hold a hotkey, speak, release — your words appear wherever your cursor is. Built on Whisper for transcription and Gemma for punctuation correction and voice commands.
 
-> **Platform support:** macOS only (Apple Silicon recommended). Windows and Linux support coming soon.
+> **Platform support:** macOS 14+ on Apple silicon only. Windows and Linux support coming soon.
 
 ## Widget states
 
@@ -22,9 +22,12 @@ A floating pill widget lives at the bottom of your screen. Drag it anywhere. It 
 - **History panel** — Hover over the idle pill, click to open a history panel showing all past transcriptions and command exchanges. Each entry has a copy (⧉) button. Command entries show the voice input and output separately with colour-coded badges.
 - **Draggable pill** — Click and drag the pill to reposition it anywhere on screen.
 - **Parallel model loading** — Whisper (MPS) and Gemma (MLX) load simultaneously at startup.
+- **Clipboard preservation** — Keeps images, rich text, and multiple clipboard items intact during copy/paste. A newer copy made during processing is preserved.
+- **Assignable hotkey** — Use “Assign Key” in History to choose a trigger; Escape cancels assignment.
+- **Safe updates** — Updates fast-forward clean checkouts and preserve local edits/commits. Shell setup preserves unrelated configuration and symlinked dotfiles.
 - **Fully transparent overlay** — Click-through everywhere except the pill itself; never steals focus.
 - **Stuck-recording protection** — Recovers both macOS event-tap disable notifications, checks hardware key state every 50 ms for dropped releases, and limits a capture to 120 seconds. Audio-device errors reset the controller so the next recording still works.
-- **Processing recovery** — Recordings are processed one at a time. Formatting failures preserve the raw Whisper transcript; formatter requests time out after 120 seconds instead of waiting forever. Wait for the pill to return to idle before recording again.
+- **Processing recovery** — Recordings are processed one at a time. Whisper requests also time out after 120 seconds; a stalled native call stays isolated until it finishes or the app restarts. Formatting failures or responses that alter/drop words preserve the raw Whisper transcript; formatter requests time out after 120 seconds instead of waiting forever. Wait for the pill to return to idle before recording again.
 
 ## Command capabilities
 
@@ -43,7 +46,7 @@ Gemma handles a wide range of voice commands in command mode:
 
 ## Requirements
 
-- macOS 12 or later (Apple Silicon recommended)
+- macOS 14 or later on Apple silicon (required by [MLX](https://ml-explore.github.io/mlx/build/html/install.html))
 - Python 3.13
 - Accessibility permission (`System Settings → Privacy & Security → Accessibility`)
 - Microphone permission (prompted on first recording)
@@ -125,7 +128,7 @@ command_and_paste    Whisper → Gemma command execution → paste
 _watch_trigger_release Re-enables the tap, recovers releases, enforces capture limit
 ```
 
-## Recording recovery regression tests
+## Regression tests
 
 ```bash
 stt_env/bin/python -m unittest discover -s tests -v
@@ -134,8 +137,21 @@ stt_env/bin/python -m unittest discover -s tests -v
 Tests replace macOS, microphone, and model I/O with fakes; only NumPy is needed.
 They cover dropped/coalesced release events, disabled taps, concurrent trigger
 updates, quick/empty recordings, device errors, command-mode selection failures,
-and formatter failures/timeouts. A physical Fn/microphone check on macOS is still
+model loading/inference failures and timeouts, rich clipboard restoration,
+selection detection, safe updates, terminal prompts, installation, and UI geometry. A physical Fn/microphone check on macOS is still
 needed to verify device-specific behavior.
+
+## Recovery behavior
+
+Model-load failures appear in the pill with a Quit action; see the terminal for
+the cause. Initial loading has a 30-minute deadline to allow first-time downloads.
+Whisper and Gemma inference each have a 120-second deadline. A native GPU call
+cannot safely be killed from Python: after a timeout, that model rejects further
+requests until the call finishes or Fiveflow is restarted. Dictation falls back
+to the raw Whisper transcript when formatting fails.
+
+The update commands refuse dirty or divergent checkouts. Commit or stash local
+work before retrying; updates no longer discard files with a hard reset.
 
 ## License
 

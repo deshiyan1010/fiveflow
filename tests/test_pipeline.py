@@ -24,6 +24,7 @@ def load_pipeline():
         'kCGEventTapDisabledByTimeout': 0xFFFFFFFE,
         'kCGEventTapDisabledByUserInput': 0xFFFFFFFF,
         'kCGEventSourceStateHIDSystemState': 1,
+        'kCGEventSourceUnixProcessID': 41,
     }.items():
         setattr(quartz, name, value)
     spec = importlib.util.spec_from_file_location(
@@ -45,11 +46,12 @@ class PipelineTests(unittest.TestCase):
         self.p._models_ready[0] = True
         self.enterContext(mock.patch.multiple(
             state, transcribe_keycode=63, listening_for_key=False,
-            on_key_assigned=None, transcription_history=[], audio_level=0.0))
+            on_key_assigned=None, transcription_history=[], audio_level=0.0,
+            ui_callbacks=queue.Queue()))
         self.widget = self.enterContext(mock.patch.object(pipeline, 'set_widget'))
         self.enterContext(mock.patch.object(pipeline, 'logger'))
         self.enterContext(mock.patch.object(pipeline, 'CGEventGetIntegerValueField',
-                                          side_effect=lambda event, field: event[0]))
+                                          side_effect=lambda event, field: event[0] if field == 9 else 0))
         self.enterContext(mock.patch.object(pipeline, 'CGEventGetFlags',
                                           side_effect=lambda event: event[1]))
         self.hardware = self.enterContext(mock.patch.object(
@@ -311,7 +313,10 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 self.p._generate_text(('transcribe', 'old'))
         _, old_response = self.p._gemma_in.get_nowait()
+        with self.assertRaisesRegex(RuntimeError, 'previous request'):
+            self.p._generate_text(('transcribe', 'still busy'))
         old_response.put('Old result')
+        self.p._gemma_pending.release()  # The old model call finally finishes.
 
         def answer_new_request(item):
             _, response = item
@@ -319,6 +324,177 @@ class PipelineTests(unittest.TestCase):
 
         with mock.patch.object(self.p._gemma_in, 'put', side_effect=answer_new_request):
             self.assertEqual(self.p._generate_text(('transcribe', 'new')), 'New result')
+
+    def test_empty_whisper_result_never_reaches_gemma_or_paste(self):
+        self.p._pipe[0] = mock.Mock(return_value={'text': '   '})
+        self.p._generate_text = mock.Mock()
+        self.p.paste_at_cursor = mock.Mock()
+        self.p.transcribe_and_paste(np.zeros(pipeline.SAMPLE_RATE))
+        self.p._generate_text.assert_not_called()
+        self.p.paste_at_cursor.assert_not_called()
+        self.widget.assert_called_with('active', 'No speech detected')
+
+    def test_empty_formatter_response_keeps_transcript(self):
+        self.p._pipe[0] = mock.Mock(return_value={'text': 'keep this'})
+        self.p._generate_text = mock.Mock(return_value='')
+        self.p.paste_at_cursor = mock.Mock()
+        self.p.transcribe_and_paste(np.zeros(pipeline.SAMPLE_RATE))
+        self.p.paste_at_cursor.assert_called_once_with('keep this')
+
+    def test_whisper_timeout_prevents_overlapping_native_calls(self):
+        entered, finish = threading.Event(), threading.Event()
+        def stalled(*args, **kwargs):
+            entered.set()
+            finish.wait(2)
+            return {'text': 'late'}
+        self.p._pipe[0] = mock.Mock(side_effect=stalled)
+        try:
+            with mock.patch.object(pipeline, 'WHISPER_TIMEOUT_SECONDS', 0.02):
+                with self.assertRaises(TimeoutError):
+                    self.p._recognize_audio(np.zeros(10))
+            self.assertTrue(entered.is_set())
+            with self.assertRaisesRegex(RuntimeError, 'previous request'):
+                self.p._recognize_audio(np.zeros(10))
+            self.p._pipe[0].assert_called_once()
+        finally:
+            finish.set()
+
+    def test_whisper_exception_propagates_and_releases_busy_guard(self):
+        self.p._pipe[0] = mock.Mock(side_effect=RuntimeError('inference failure'))
+        with self.assertRaisesRegex(RuntimeError, 'inference failure'):
+            self.p._recognize_audio(np.zeros(10))
+        self.assertFalse(self.p._whisper_pending.locked())
+
+    def test_gemma_load_failure_signals_readiness_error_instead_of_hanging(self):
+        ready = threading.Event()
+        with mock.patch.object(pipeline, 'vlm_load', side_effect=RuntimeError('download failed')):
+            self.p._gemma_worker(ready)
+        self.assertTrue(ready.is_set())
+        name, error = self.p._load_errors.get_nowait()
+        self.assertEqual(name, 'Gemma')
+        self.assertIsInstance(error, RuntimeError)
+
+    def test_model_load_error_never_enables_recording(self):
+        def fail_loader():
+            self.p._load_errors.put(('Whisper', RuntimeError('bad weights')))
+        with mock.patch.object(pipeline.threading, 'Thread') as worker:
+            worker.return_value.start.side_effect = fail_loader
+            self.p._models_ready[0] = False
+            self.p.load_models()
+        self.assertFalse(self.p._models_ready[0])
+        self.widget.assert_called_with('error', 'Whisper load failed')
+
+    def test_model_load_timeout_shows_error_instead_of_loading_forever(self):
+        self.p._models_ready[0] = False
+        with mock.patch.object(pipeline.threading, 'Thread'):
+            with mock.patch.object(pipeline, 'MODEL_LOAD_TIMEOUT_SECONDS', 0):
+                self.p.load_models()
+        self.assertFalse(self.p._models_ready[0])
+        self.widget.assert_called_with('error', 'Model load failed')
+
+    def test_key_assignment_escape_cancels_and_queues_ui_callback(self):
+        state.listening_for_key = True
+        state.on_key_assigned = mock.Mock()
+        self.event(53, 0, pipeline.kCGEventKeyDown)
+        self.assertFalse(state.listening_for_key)
+        self.assertEqual(state.transcribe_keycode, 63)
+        state.on_key_assigned.assert_not_called()
+        self.assertEqual(state.ui_callbacks.get_nowait(), (state.on_key_assigned, 63))
+
+    def test_modifier_release_does_not_get_assigned_as_new_hotkey(self):
+        state.listening_for_key = True
+        self.event(56, 0)
+        self.assertTrue(state.listening_for_key)
+        self.assertEqual(state.transcribe_keycode, 63)
+
+    def test_synthetic_shortcuts_do_not_trigger_recording(self):
+        with mock.patch.object(pipeline, 'CGEventGetIntegerValueField',
+                               side_effect=lambda event, field: pipeline.os.getpid() if field == 41 else 63):
+            self.event(63, FN)
+        self.assertEqual(self.drain(), [])
+
+    def test_inactive_audio_stream_recovers_while_trigger_remains_held(self):
+        self.event(63, FN)
+        self.p._stream = mock.Mock(active=False)
+        self.p._recording = True
+        self.p._stream_started_at -= 1
+        self.p._poll_trigger_release()
+        self.assertEqual(self.drain(), [(True, False), (False, False)])
+
+    def test_caps_lock_trigger_records_even_when_toggling_flag_off(self):
+        state.transcribe_keycode = 57
+        self.event(57, 0)
+        self.assertEqual(self.drain(), [(True, False)])
+
+    def test_shutdown_closes_microphone_disables_tap_and_prevents_new_capture(self):
+        stream = mock.Mock()
+        self.p._stream = stream
+        self.p._recording = True
+        self.p._tap_ref[0] = 'tap'
+        self.p.shutdown()
+        self.p.shutdown()  # idempotent
+        stream.abort.assert_called_once()
+        stream.close.assert_called_once()
+        self.enable.assert_called_with('tap', False)
+        with mock.patch.object(self.p, '_open_audio_stream') as start:
+            self.p._handle_trigger_transition(True, False)
+        start.assert_not_called()
+
+    def test_shortcuts_wait_for_modifiers_and_suppress_injected_triggers(self):
+        keyboard = mock.Mock()
+        keyboard.pressed.return_value.__enter__ = mock.Mock()
+        keyboard.pressed.return_value.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.object(pipeline, 'CGEventSourceFlagsState', side_effect=[SHIFT, 0, 0]):
+            with mock.patch.object(pipeline.time, 'sleep') as wait:
+                with mock.patch.object(pipeline, 'KeyboardController', return_value=keyboard):
+                    self.p._send_shortcut('v')
+        wait.assert_called_once_with(0.01)
+        keyboard.press.assert_called_once_with('v')
+        self.assertFalse(self.p._injecting_keys)
+
+    def test_shutdown_worker_sentinel_exits_cleanly(self):
+        self.p.shutdown()
+        self.p._recording_controller()
+        self.assertEqual(self.p._trigger_events.unfinished_tasks, 0)
+
+    def test_formatter_cannot_silently_drop_or_add_dictated_words(self):
+        for reply in ('these words', 'Here is your text: keep all these words'):
+            with self.subTest(reply=reply):
+                self.p._recognize_audio = mock.Mock(return_value='keep all these words')
+                self.p._generate_text = mock.Mock(return_value=reply)
+                self.p.paste_at_cursor = mock.Mock()
+                self.p.transcribe_and_paste(np.zeros(10))
+                self.p.paste_at_cursor.assert_called_once_with('keep all these words')
+
+    def test_formatter_can_correct_punctuation_capitals_and_apostrophe_style(self):
+        self.p._recognize_audio = mock.Mock(return_value="it's ready keep going")
+        self.p._generate_text = mock.Mock(return_value='It’s ready, keep going!')
+        self.p.paste_at_cursor = mock.Mock()
+        self.p.transcribe_and_paste(np.zeros(10))
+        self.p.paste_at_cursor.assert_called_once_with('It’s ready, keep going!')
+
+    def test_accessibility_empty_selection_does_not_copy_whole_editor_line(self):
+        with mock.patch.object(pipeline.clipboard, 'accessibility_selection', return_value=''):
+            with mock.patch.object(pipeline.clipboard, 'selected_text') as copy:
+                self.assertEqual(self.p.get_selected_text(), '')
+        copy.assert_not_called()
+
+    def test_unsupported_accessibility_selection_falls_back_to_clipboard(self):
+        with mock.patch.object(pipeline.clipboard, 'accessibility_selection', return_value=None):
+            with mock.patch.object(pipeline.clipboard, 'selected_text', return_value='selected'):
+                self.assertEqual(self.p.get_selected_text(), 'selected')
+
+    def test_caps_lock_toggle_off_is_assignable_and_other_flags_do_not_release_it(self):
+        state.listening_for_key = True
+        self.event(57, 0)
+        self.assertEqual(state.transcribe_keycode, 57)
+        self.p._trigger_down_since -= 1
+        self.hardware.return_value = False
+        self.p._poll_trigger_release()
+        self.hardware.return_value = True
+        self.event(57, 0)
+        self.event(56, 0)
+        self.assertEqual(self.drain(), [(True, False)])
 
 
 if __name__ == '__main__':
